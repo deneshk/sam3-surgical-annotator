@@ -188,6 +188,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         use_prev_mem_frame=False,
         normalize_coords=True,
         box=None,
+        external_prev_mask_logits=None,
     ):
         """Add new points to a frame."""
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
@@ -289,19 +290,20 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             )
         # Get any previously predicted mask logits on this object and feed it along with
         # the new clicks into the SAM mask decoder when `self.iter_use_prev_mask_pred=True`.
-        prev_sam_mask_logits = None
+        prev_sam_mask_logits = external_prev_mask_logits
         if self.iter_use_prev_mask_pred:
             # lookup temporary output dict first, which contains the most recent output
             # (if not found, then lookup conditioning and non-conditioning frame output)
-            prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
-            if prev_out is None:
-                prev_out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
+            if prev_sam_mask_logits is None:
+                prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
                 if prev_out is None:
-                    prev_out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
+                    prev_out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
+                    if prev_out is None:
+                        prev_out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
 
-            if prev_out is not None and prev_out["pred_masks"] is not None:
-                prev_sam_mask_logits = prev_out["pred_masks"].cuda(non_blocking=True)
-                # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
+                if prev_out is not None and prev_out["pred_masks"] is not None:
+                    prev_sam_mask_logits = prev_out["pred_masks"].cuda(non_blocking=True)
+            if prev_sam_mask_logits is not None:
                 prev_sam_mask_logits = torch.clamp(prev_sam_mask_logits, -32.0, 32.0)
         current_out, _ = self._run_single_frame_inference(
             inference_state=inference_state,

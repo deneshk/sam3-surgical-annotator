@@ -72,6 +72,7 @@ class Sam3VideoPredictor:
                 point_labels=request.get("point_labels", None),
                 bounding_boxes=request.get("bounding_boxes", None),
                 bounding_box_labels=request.get("bounding_box_labels", None),
+                mask_inputs=request.get("mask_inputs", None),
                 obj_id=request.get("obj_id", None),
             )
         elif request_type == "remove_object":
@@ -139,13 +140,15 @@ class Sam3VideoPredictor:
         point_labels: Optional[List[int]] = None,
         bounding_boxes: Optional[List[List[float]]] = None,
         bounding_box_labels: Optional[List[int]] = None,
+        mask_inputs=None,
         obj_id: Optional[int] = None,
     ):
         """Add text, box and/or point prompt on a specific video frame."""
         logger.debug(
             f"add prompt on frame {frame_idx} in session {session_id}: "
             f"{text=}, {points=}, {point_labels=}, "
-            f"{bounding_boxes=}, {bounding_box_labels=}"
+            f"{bounding_boxes=}, {bounding_box_labels=}, "
+            f"has_mask_inputs={mask_inputs is not None}"
         )
         session = self._get_session(session_id)
         inference_state = session["state"]
@@ -158,6 +161,7 @@ class Sam3VideoPredictor:
             point_labels=point_labels,
             boxes_xywh=bounding_boxes,
             box_labels=bounding_box_labels,
+            mask_inputs=mask_inputs,
             obj_id=obj_id,
         )
         return {"frame_index": frame_idx, "outputs": outputs}

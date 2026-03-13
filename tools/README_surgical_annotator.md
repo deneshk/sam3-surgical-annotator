@@ -4,6 +4,10 @@
 - Loads a directory of image frames as a video sequence.
 - Lets you create objects and set one active object at a time.
 - Each object has a checkbox in the object list to enable/disable propagation for that object.
+- Uses a single canonical box per object/frame in the main workflow; drawn, propagated, and edited boxes are the same UI annotation.
+- Newly drawn boxes and unlocked box edits are refined on the current frame with SAM3; the visible box is replaced by the box derived from the segmentation.
+- `Lock Current Box` preserves a manual box on the current frame and prevents SAM3 from overwriting it there.
+- The current frame annotation list stays visible in the main UI, including the box plus any point prompts for the active object.
 - Clicks add positive/negative point prompts (up to 6) for active object on current frame.
 - Box prompts can be drawn by selecting `Box (drag)` and dragging on the image.
 - Existing box prompts can be edited while `Box (drag)` mode is active:
@@ -11,13 +15,14 @@
   - drag a corner handle to resize both axes
   - drag an edge handle to resize one axis
   - drag inside the already-selected box to move it
-- Prompt boxes are drawn as dashed outlines; predicted boxes are drawn as solid outlines.
+- In the default workflow, boxes are the primary visible annotation surface; masks remain background data.
 - Use the mouse wheel to zoom the image view.
 - Use right-click drag to pan the zoomed image view.
 - Use `Fit to Screen` to reset zoom and pan to the default fitted view.
 - Use the frame slider to scrub through the loaded frames.
 - Use the `Go to` box to jump directly to a frame number.
 - Hotkeys: Left/Right arrows move frame-by-frame, `P` starts propagation.
+- `Auto Propagate Next Frame` can propagate checked objects one frame ahead when the right arrow is used.
 - Internally, each box prompt is passed to SAM3 as two point prompts with labels `(2, 3)`.
 - View controls let you independently show/hide prompts, segmentations, and derived boxes.
 - Segmentation opacity is adjustable from `0.00` to `1.00`.
@@ -56,26 +61,28 @@ python3 surgical_annotator_qt.py
 1. `Load Frame Directory` from menu.
 2. Add objects on the right panel.
    - The currently active object is highlighted and shown below the object list.
-3. Select prompt mode (`Positive`, `Negative`, or `Box (drag)`).
-4. Add prompts:
-   - Click image for point prompts.
-   - Drag on image for box prompts.
-    - In `Box (drag)` mode, click a box to reveal handles, then drag a handle to resize or drag inside the selected box to move it.
-   - Prompt boxes cannot be edited while `Show Prompts` is off.
-5. Click `Segment`.
-6. Refine by adding/removing points.
-7. Use the `View` controls to toggle prompts/segmentations/boxes and tune mask opacity or box thickness.
-8. Set `N frames`, `Chunks`, `Sample pts`, `Carryover` mode, and optional `Pause Between Chunks`.
-9. Click `Propagate`.
+3. Draw a box for the active object on the current frame.
+   - Click the existing box to reveal handles, then drag a handle to resize or drag inside the selected box to move it.
+   - Unlocked boxes are immediately refined by SAM3 on the current frame.
+   - Lock the current box when you want to keep a manual edit without SAM3 overwrite.
+   - The annotation list in the main panel shows the active object's box and any point prompts on the current frame.
+4. Optionally enable `Auto Propagate Next Frame`.
+   - With the toggle on, pressing the right arrow attempts a one-frame propagation for checked objects before moving to the next frame.
+5. Use the `View` controls to toggle segmentations/boxes and tune mask opacity or box thickness.
+6. Set `N frames`, `Chunks`, `Sample pts`, `Carryover` mode, and optional `Pause Between Chunks` when using manual propagation.
+7. Click `Propagate`.
     - Only checked objects are included in propagation.
-   - On the first propagation chunk, enabled objects must have either manual prompts on the seed frame or an existing stored mask on that frame; stored masks are converted to box prompts automatically.
-10. If pause is enabled and chunks remain, review/correct and click `Continue Propagate`.
-11. `Export COCO` from menu when done.
+   - The canonical box on the seed frame is used as the primary propagation input.
+8. If pause is enabled and chunks remain, review/correct and click `Continue Propagate`.
+9. Use `Show Advanced Prompt Controls` only when you want the older point-prompt workflow.
+10. `Export COCO` from menu when done.
 
 ## Notes
 - If checkpoint/BPE fields are left at default, SAM3 will use its default loading path.
 - If needed, type custom checkpoint/BPE paths in the editable combo fields.
 - Bounding boxes are derived from SAM3 masks.
+- Locked boxes are preserved on their own frame but still used as seeds for future propagation.
+- When propagation advances to a later frame, the propagated box is stored there and the prior frame's point prompts are carried forward for the same object.
 - Manual prompts are only used for the chunk whose seed frame contains those prompts.
 - For carryover chunks, if the seed frame has no manual prompts, prompts are sampled from the seed frame's last known masks.
 - In `Mask AABB Box` carryover mode, last masks are converted to axis-aligned boxes and passed as point labels `(2,3)`.

@@ -841,6 +841,7 @@ class Sam3VideoInference(Sam3VideoBase):
         text_str=None,
         boxes_xywh=None,
         box_labels=None,
+        mask_inputs=None,
     ):
         """
         Add text, point or box prompts on a single frame. This method returns the inference
@@ -853,8 +854,8 @@ class Sam3VideoInference(Sam3VideoBase):
 
         num_frames = inference_state["num_frames"]
         assert (
-            text_str is not None or boxes_xywh is not None
-        ), "at least one type of prompt (text, boxes) must be provided"
+            text_str is not None or boxes_xywh is not None or mask_inputs is not None
+        ), "at least one type of prompt (text, boxes, mask_inputs) must be provided"
         assert (
             0 <= frame_idx < num_frames
         ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
@@ -897,6 +898,12 @@ class Sam3VideoInference(Sam3VideoBase):
             )
 
             inference_state["per_frame_geometric_prompt"][frame_idx] = geometric_prompt
+
+        if mask_inputs is not None:
+            raise NotImplementedError(
+                "mask_inputs are not supported on the base video inference path; "
+                "use the instance-interactivity path with obj_id."
+            )
 
         out = self._run_single_frame_inference(
             inference_state, frame_idx, reverse=False
@@ -1363,23 +1370,25 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         box_labels=None,
         points=None,
         point_labels=None,
+        mask_inputs=None,
         obj_id=None,
         rel_coordinates=True,
     ):
-        if points is not None:
+        if points is not None or mask_inputs is not None:
             # Tracker instance prompts
             assert (
                 text_str is None and boxes_xywh is None
-            ), "When points are provided, text_str and boxes_xywh must be None."
+            ), "When points or mask_inputs are provided, text_str and boxes_xywh must be None."
             assert (
                 obj_id is not None
-            ), "When points are provided, obj_id must be provided."
+            ), "When points or mask_inputs are provided, obj_id must be provided."
             return self.add_tracker_new_points(
                 inference_state,
                 frame_idx,
                 obj_id=obj_id,
                 points=points,
                 labels=point_labels,
+                mask_inputs=mask_inputs,
                 rel_coordinates=rel_coordinates,
                 use_prev_mem_frame=self.use_prev_mem_frame,
             )
@@ -1391,6 +1400,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 text_str=text_str,
                 boxes_xywh=boxes_xywh,
                 box_labels=box_labels,
+                mask_inputs=mask_inputs,
             )
 
     @torch.inference_mode()
@@ -1401,6 +1411,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         obj_id,
         points,
         labels,
+        mask_inputs=None,
         rel_coordinates=True,
         use_prev_mem_frame=False,
     ):
@@ -1527,6 +1538,17 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                             obj_idx
                         ] = self.masklet_confirmation_consecutive_det_thresh
 
+        external_prev_mask_logits = None
+        if mask_inputs is not None:
+            if not isinstance(mask_inputs, torch.Tensor):
+                mask_inputs = torch.tensor(mask_inputs, dtype=torch.float32)
+            if mask_inputs.dim() == 2:
+                mask_inputs = mask_inputs.unsqueeze(0).unsqueeze(0)
+            elif mask_inputs.dim() == 3:
+                mask_inputs = mask_inputs.unsqueeze(0)
+            assert mask_inputs.dim() == 4 and mask_inputs.shape[1] == 1
+            external_prev_mask_logits = mask_inputs.float().to(tracker_state["device"])
+
         if self.rank == obj_rank:
             frame_idx, obj_ids, low_res_masks, video_res_masks = (
                 self.tracker.add_new_points(
@@ -1538,6 +1560,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     clear_old_points=True,
                     rel_coordinates=rel_coordinates,
                     use_prev_mem_frame=use_prev_mem_frame,
+                    external_prev_mask_logits=external_prev_mask_logits,
                 )
             )
 

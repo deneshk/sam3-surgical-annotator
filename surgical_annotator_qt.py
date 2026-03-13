@@ -184,19 +184,24 @@ class Sam3Adapter:
         obj_id: int,
         points_rel: List[List[float]],
         labels: List[int],
+        mask_input: Optional[np.ndarray] = None,
     ) -> SamFrameOutput:
         if not self.session_id:
             raise RuntimeError("No active SAM3 session")
 
+        request = {
+            "type": "add_prompt",
+            "session_id": self.session_id,
+            "frame_index": frame_idx,
+            "points": points_rel,
+            "point_labels": labels,
+            "obj_id": obj_id,
+        }
+        if mask_input is not None:
+            request["mask_inputs"] = np.asarray(mask_input).astype(np.float32)
+
         response = self.predictor.handle_request(
-            request={
-                "type": "add_prompt",
-                "session_id": self.session_id,
-                "frame_index": frame_idx,
-                "points": points_rel,
-                "point_labels": labels,
-                "obj_id": obj_id,
-            }
+            request=request
         )
         return self._parse_output(response["outputs"])
 
@@ -246,6 +251,7 @@ class AnnotatorMainWindow(QMainWindow):
 
         self.prompts_by_frame_obj: Dict[int, Dict[int, List[PointPrompt]]] = {}
         self.box_prompts_by_frame_obj: Dict[int, Dict[int, BoxPrompt]] = {}
+        self.box_locked_by_frame_obj: Dict[int, Dict[int, bool]] = {}
         self.outputs_by_frame: Dict[int, SamFrameOutput] = {}
         self._active_prompt_rows: List[Tuple[str, int]] = []
 
@@ -266,13 +272,16 @@ class AnnotatorMainWindow(QMainWindow):
         self._box_drag_reference_box: Optional[BoxPrompt] = None
         self._box_drag_offset_xy: Tuple[int, int] = (0, 0)
         self._selected_box_obj_id: Optional[int] = None
+        self.show_advanced_controls: bool = False
         self.show_prompts: bool = True
         self.show_segmentations: bool = True
         self.show_boxes: bool = True
+        self.auto_propagate_next: bool = False
         self.segmentation_opacity: float = 0.6
         self.box_line_thickness: int = 2
 
         self._setup_ui()
+        self._initialize_sam_adapter(show_errors=False)
 
     def _setup_ui(self) -> None:
         load_action = QAction("Load Frame Directory", self)
@@ -356,13 +365,23 @@ class AnnotatorMainWindow(QMainWindow):
         obj_row.addWidget(self.remove_obj_btn)
         right_layout.addLayout(obj_row)
 
-        right_layout.addWidget(QLabel("Prompt Mode"))
+        self.auto_propagate_next_check = QCheckBox("Auto Propagate Next Frame")
+        self.auto_propagate_next_check.toggled.connect(self._on_auto_propagate_next_toggled)
+        right_layout.addWidget(self.auto_propagate_next_check)
+
+        self.prompt_mode_label = QLabel("Advanced Prompt Mode")
+        right_layout.addWidget(self.prompt_mode_label)
         self.prompt_mode_combo = QComboBox()
         self.prompt_mode_combo.addItems(["Positive (+)", "Negative (-)", "Box (drag)"])
+        self.prompt_mode_combo.setCurrentIndex(2)
         self.prompt_mode_combo.currentIndexChanged.connect(self._on_prompt_mode_changed)
         right_layout.addWidget(self.prompt_mode_combo)
 
-        right_layout.addWidget(QLabel("Active Object Prompts (Current Frame)"))
+        self.annotation_list_label = QLabel("Current Frame Annotations")
+        right_layout.addWidget(self.annotation_list_label)
+        self.lock_current_box_check = QCheckBox("Lock Current Box")
+        self.lock_current_box_check.toggled.connect(self._on_lock_current_box_toggled)
+        right_layout.addWidget(self.lock_current_box_check)
         self.point_list = QListWidget()
         right_layout.addWidget(self.point_list)
 
@@ -378,6 +397,10 @@ class AnnotatorMainWindow(QMainWindow):
         self.segment_btn = QPushButton("Segment")
         self.segment_btn.clicked.connect(self.segment_current_frame)
         right_layout.addWidget(self.segment_btn)
+
+        self.advanced_controls_check = QCheckBox("Show Advanced Prompt Controls")
+        self.advanced_controls_check.toggled.connect(self._on_advanced_controls_toggled)
+        right_layout.addWidget(self.advanced_controls_check)
 
         right_layout.addWidget(QLabel("View"))
         self.show_prompts_check = QCheckBox("Show Prompts")
@@ -452,6 +475,15 @@ class AnnotatorMainWindow(QMainWindow):
         right_layout.addWidget(self.mode_label)
         right_layout.addStretch(1)
 
+        self._advanced_widgets = [
+            self.prompt_mode_label,
+            self.prompt_mode_combo,
+            self.segment_btn,
+            self.show_prompts_check,
+        ]
+        self._set_advanced_controls_visible(False)
+        self.mode_label.setText("Mode: Box Annotation")
+
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setSizes([1100, 500])
@@ -463,6 +495,35 @@ class AnnotatorMainWindow(QMainWindow):
     def _on_prompt_mode_changed(self, idx: int) -> None:
         self.current_prompt_positive = idx == 0
 
+    def _on_auto_propagate_next_toggled(self, checked: bool) -> None:
+        self.auto_propagate_next = checked
+
+    def _on_lock_current_box_toggled(self, checked: bool) -> None:
+        if self.active_object_id is None:
+            self.lock_current_box_check.blockSignals(True)
+            self.lock_current_box_check.setChecked(False)
+            self.lock_current_box_check.blockSignals(False)
+            return
+        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+        if self.active_object_id not in frame_boxes:
+            self.lock_current_box_check.blockSignals(True)
+            self.lock_current_box_check.setChecked(False)
+            self.lock_current_box_check.blockSignals(False)
+            return
+        self._set_current_box_locked(self.current_frame_idx, self.active_object_id, checked)
+        self.refresh_point_list()
+        self._render_current_frame()
+
+    def _on_advanced_controls_toggled(self, checked: bool) -> None:
+        self.show_advanced_controls = checked
+        self._set_advanced_controls_visible(checked)
+        self.mode_label.setText("Mode: Prompt" if self._use_point_prompt_mode() else "Mode: Box Annotation")
+        self._render_current_frame()
+
+    def _set_advanced_controls_visible(self, visible: bool) -> None:
+        for widget in self._advanced_widgets:
+            widget.setVisible(visible)
+
     def _on_object_selection_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
         if current is None:
             self.active_object_id = None
@@ -471,6 +532,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._sync_selected_box_state()
         self._refresh_object_list_visuals()
         self.refresh_point_list()
+        self._sync_current_box_lock_check()
         self._render_current_frame()
 
     def _setup_shortcuts(self) -> None:
@@ -481,7 +543,7 @@ class AnnotatorMainWindow(QMainWindow):
 
         next_action = QAction(self)
         next_action.setShortcut(QKeySequence(Qt.Key_Right))
-        next_action.triggered.connect(self.go_next_frame)
+        next_action.triggered.connect(self.go_next_frame_shortcut)
         self.addAction(next_action)
 
         propagate_action = QAction(self)
@@ -511,6 +573,21 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_line_thickness = int(self.box_line_thickness_spin.value())
         self._render_current_frame()
 
+    def _sync_current_box_lock_check(self) -> None:
+        has_box = False
+        checked = False
+        if self.active_object_id is not None:
+            frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+            has_box = self.active_object_id in frame_boxes
+            checked = self._is_current_box_locked(self.current_frame_idx, self.active_object_id)
+        self.lock_current_box_check.blockSignals(True)
+        self.lock_current_box_check.setEnabled(has_box)
+        self.lock_current_box_check.setChecked(checked if has_box else False)
+        self.lock_current_box_check.blockSignals(False)
+
+    def _use_point_prompt_mode(self) -> bool:
+        return self.show_advanced_controls and self.prompt_mode_combo.currentIndex() != 2
+
     def load_frame_directory(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Select Frame Directory")
         if not directory:
@@ -525,8 +602,13 @@ class AnnotatorMainWindow(QMainWindow):
         self._checkpoint_path = self._read_optional_combo_path(self.checkpoint_combo)
         self._bpe_path = self._read_optional_combo_path(self.bpe_combo)
 
-        # Reset any previous adapter so it will be re-initialised on next segment/propagate
-        self.sam_adapter = None
+        if self.sam_adapter is not None:
+            try:
+                self.sam_adapter.close_session()
+            except Exception:
+                pass
+            self.sam_adapter = None
+        self._initialize_sam_adapter(show_errors=True)
 
         self.image_dir = dir_path
         self.frame_paths = frame_paths
@@ -537,9 +619,10 @@ class AnnotatorMainWindow(QMainWindow):
         self.active_object_id = None
         self.prompts_by_frame_obj.clear()
         self.box_prompts_by_frame_obj.clear()
+        self.box_locked_by_frame_obj.clear()
         self.outputs_by_frame.clear()
         self.segment_mode = False
-        self.mode_label.setText("Mode: Prompt")
+        self.mode_label.setText("Mode: Box Annotation")
         self._clear_pending_propagation_state()
         self._box_draw_start_xy = None
         self._box_draw_start_ui_xy = None
@@ -553,8 +636,15 @@ class AnnotatorMainWindow(QMainWindow):
         self._box_drag_offset_xy = (0, 0)
         self._selected_box_obj_id = None
         self._box_rubber_band.hide()
+        self.auto_propagate_next = False
+        self.auto_propagate_next_check.setChecked(False)
+        self.show_advanced_controls = False
+        self.advanced_controls_check.setChecked(False)
+        self.prompt_mode_combo.setCurrentIndex(2)
+        self._set_advanced_controls_visible(False)
         self._sync_frame_navigation_controls()
         self._refresh_object_list_visuals()
+        self._sync_current_box_lock_check()
 
         self._render_current_frame()
         self.statusBar().showMessage(f"Loaded {len(self.frame_paths)} frames from {dir_path}")
@@ -599,6 +689,8 @@ class AnnotatorMainWindow(QMainWindow):
             frame_map.pop(obj_id, None)
         for frame_map in self.box_prompts_by_frame_obj.values():
             frame_map.pop(obj_id, None)
+        for frame_map in self.box_locked_by_frame_obj.values():
+            frame_map.pop(obj_id, None)
 
         for frame_idx, out in list(self.outputs_by_frame.items()):
             keep_idx = [i for i, oid in enumerate(out.obj_ids) if oid != obj_id]
@@ -631,6 +723,63 @@ class AnnotatorMainWindow(QMainWindow):
         if not self.frame_paths:
             return
         self._set_current_frame_idx(min(len(self.frame_paths) - 1, self.current_frame_idx + 1))
+
+    def go_next_frame_shortcut(self) -> None:
+        if not self.frame_paths:
+            return
+        if self.auto_propagate_next and self.current_frame_idx < len(self.frame_paths) - 1:
+            if self._auto_propagate_next_frame():
+                self._set_current_frame_idx(min(len(self.frame_paths) - 1, self.current_frame_idx + 1))
+                return
+        self.go_next_frame()
+
+    def _auto_propagate_next_frame(self) -> bool:
+        enabled_obj_ids = self._get_enabled_propagation_obj_ids()
+        if not enabled_obj_ids:
+            self.statusBar().showMessage("No objects enabled for auto propagation; moving to next frame.")
+            return False
+
+        missing_obj_ids = [
+            obj_id for obj_id in enabled_obj_ids
+            if self.box_prompts_by_frame_obj.get(self.current_frame_idx, {}).get(obj_id) is None
+        ]
+        if missing_obj_ids:
+            missing_names = [
+                self._find_object(obj_id).name if self._find_object(obj_id) else str(obj_id)
+                for obj_id in missing_obj_ids
+            ]
+            QMessageBox.warning(
+                self,
+                "Auto propagation skipped",
+                "These enabled objects have no box on the current frame: " + ", ".join(missing_names),
+            )
+            return False
+
+        if not self._ensure_sam_initialized():
+            return False
+
+        unlocked_obj_ids = {
+            obj_id for obj_id in enabled_obj_ids
+            if not self._is_current_box_locked(self.current_frame_idx, obj_id)
+        }
+        if unlocked_obj_ids:
+            self._refine_current_frame_boxes(unlocked_obj_ids, show_no_prompts=False)
+
+        result = self._run_propagation_chunk(
+            seed_frame_idx=self.current_frame_idx,
+            n_frames=2,
+            use_carryover_sampling=False,
+            sample_points_per_object=self.sample_points_spin.value(),
+            carryover_mode=self.carryover_mode_combo.currentText(),
+            enabled_obj_ids=enabled_obj_ids,
+        )
+        if result is None:
+            return False
+
+        self.statusBar().showMessage(
+            f"Auto propagated checked objects to frame {self.current_frame_idx + 2}."
+        )
+        return True
 
     def _set_current_frame_idx(self, frame_idx: int) -> None:
         if not self.frame_paths:
@@ -716,7 +865,7 @@ class AnnotatorMainWindow(QMainWindow):
         if not self.frame_paths:
             return
         if self.active_object_id is None:
-            QMessageBox.information(self, "No active object", "Select an object before adding points.")
+            QMessageBox.information(self, "No active object", "Select an object before annotating.")
             return
 
         mapped = self._map_ui_to_image_xy(ui_x, ui_y)
@@ -725,8 +874,8 @@ class AnnotatorMainWindow(QMainWindow):
         x_px, y_px = mapped
 
         if self._is_box_mode():
-            if not self.show_prompts:
-                self.statusBar().showMessage("Enable Show Prompts to edit prompt boxes.")
+            if not self.show_boxes:
+                self.statusBar().showMessage("Enable Show Boxes to edit annotation boxes.")
                 return
             preview_box, is_edit = self._begin_box_interaction(x_px, y_px)
             if preview_box is None:
@@ -784,11 +933,12 @@ class AnnotatorMainWindow(QMainWindow):
         frame_boxes[self.active_object_id] = box
         self._selected_box_obj_id = self.active_object_id
         self.refresh_point_list()
-
-        if self.segment_mode:
-            self.segment_current_frame()
-        else:
-            self._render_current_frame()
+        is_locked = self._is_current_box_locked(self.current_frame_idx, self.active_object_id)
+        self._sync_current_box_lock_check()
+        if not is_locked:
+            self._refine_current_frame_boxes({self.active_object_id}, show_no_prompts=False)
+            return
+        self._render_current_frame()
 
     def _get_active_points(self) -> List[PointPrompt]:
         frame_map = self.prompts_by_frame_obj.setdefault(self.current_frame_idx, {})
@@ -799,17 +949,18 @@ class AnnotatorMainWindow(QMainWindow):
         self._active_prompt_rows = []
         if self.active_object_id is None:
             return
+        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+        box = frame_boxes.get(self.active_object_id)
+        if box:
+            lock_suffix = " [Locked]" if self._is_current_box_locked(self.current_frame_idx, self.active_object_id) else ""
+            self.point_list.addItem(f"Box{lock_suffix} ({box.x1_px}, {box.y1_px}) -> ({box.x2_px}, {box.y2_px})")
+            self._active_prompt_rows.append(("box", 0))
         frame_map = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
         points = frame_map.get(self.active_object_id, [])
         for i, p in enumerate(points, start=1):
             sign = "+" if p.is_positive else "-"
             self.point_list.addItem(f"{i}. {sign} ({p.x_px}, {p.y_px})")
             self._active_prompt_rows.append(("point", i - 1))
-        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
-        box = frame_boxes.get(self.active_object_id)
-        if box:
-            self.point_list.addItem(f"Box ({box.x1_px}, {box.y1_px}) -> ({box.x2_px}, {box.y2_px})")
-            self._active_prompt_rows.append(("box", 0))
 
     def remove_selected_prompt(self) -> None:
         if self.active_object_id is None:
@@ -829,8 +980,13 @@ class AnnotatorMainWindow(QMainWindow):
         elif prompt_type == "box":
             frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
             frame_boxes.pop(self.active_object_id, None)
+            self._set_current_box_locked(self.current_frame_idx, self.active_object_id, False)
             if self._selected_box_obj_id == self.active_object_id:
                 self._selected_box_obj_id = None
+            self._remove_object_output_from_frame(self.current_frame_idx, self.active_object_id)
+            self.refresh_point_list()
+            self._render_current_frame()
+            return
         else:
             return
         self.refresh_point_list()
@@ -842,61 +998,81 @@ class AnnotatorMainWindow(QMainWindow):
         frame_map = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
         frame_map[self.active_object_id] = []
         frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+        removed_box = self.active_object_id in frame_boxes
         frame_boxes.pop(self.active_object_id, None)
+        self._set_current_box_locked(self.current_frame_idx, self.active_object_id, False)
         if self._selected_box_obj_id == self.active_object_id:
             self._selected_box_obj_id = None
         self.refresh_point_list()
+        if removed_box:
+            self._remove_object_output_from_frame(self.current_frame_idx, self.active_object_id)
+            self._render_current_frame()
+            return
         self._refresh_after_prompt_edit()
 
     def _ensure_sam_initialized(self) -> bool:
-        """Lazily load the SAM3 model weights (no session started here). Returns True if ready."""
+        """Ensure the SAM3 model wrapper is available (no session started here)."""
         if self.sam_adapter is not None:
             return True
-        if self.image_dir is None:
-            QMessageBox.warning(self, "No session", "Load a frame directory first.")
-            return False
+        return self._initialize_sam_adapter(show_errors=True)
+
+    def _initialize_sam_adapter(self, show_errors: bool) -> bool:
         try:
             self.sam_adapter = Sam3Adapter(
                 checkpoint_path=self._checkpoint_path,
                 bpe_path=self._bpe_path,
             )
         except Exception as exc:
-            QMessageBox.critical(self, "SAM3 init failed", str(exc))
             self.sam_adapter = None
+            if show_errors:
+                QMessageBox.critical(self, "SAM3 init failed", str(exc))
             return False
         return True
 
     def segment_current_frame(self) -> None:
-        if not self._ensure_sam_initialized():
-            return
-
         frame_prompts = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
         frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
-        obj_ids = [
+        obj_ids = {
             obj.obj_id
             for obj in self.objects
             if frame_prompts.get(obj.obj_id) or frame_boxes.get(obj.obj_id)
-        ]
-        if not obj_ids:
-            QMessageBox.information(self, "No prompts", "Add point or box prompts for at least one object on this frame.")
-            return
+        }
+        self._refine_current_frame_boxes(obj_ids, show_no_prompts=True)
 
-        # Start a fresh single-frame session for just the current image
+    def _refine_current_frame_boxes(
+        self,
+        obj_ids: set[int],
+        show_no_prompts: bool,
+    ) -> bool:
+        if not obj_ids:
+            if show_no_prompts:
+                QMessageBox.information(self, "No prompts", "Add point or box prompts for at least one object on this frame.")
+            return False
+        if not self._ensure_sam_initialized():
+            return False
+
+        frame_prompts = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
+        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+
         try:
             img_pil = PilImage.open(str(self.frame_paths[self.current_frame_idx]))
             self.sam_adapter.start_session([img_pil])
         except Exception as exc:
             QMessageBox.critical(self, "SAM3 session failed", str(exc))
-            return
+            return False
 
         image = cv2.imread(str(self.frame_paths[self.current_frame_idx]))
+        if image is None:
+            QMessageBox.critical(self, "Segmentation failed", "Failed to load current frame.")
+            return False
         h, w = image.shape[:2]
         composite = self.outputs_by_frame.get(
             self.current_frame_idx,
             SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
         )
 
-        for obj_id in obj_ids:
+        refined_any = False
+        for obj_id in sorted(obj_ids):
             points = frame_prompts.get(obj_id, [])
             points_rel = [[p.x_px / w, p.y_px / h] for p in points]
             labels = [1 if p.is_positive else 0 for p in points]
@@ -910,7 +1086,6 @@ class AnnotatorMainWindow(QMainWindow):
                 continue
 
             try:
-                # Always frame_idx=0 since the session holds only the current frame
                 result = self.sam_adapter.add_object_points(
                     frame_idx=0,
                     obj_id=obj_id,
@@ -919,12 +1094,11 @@ class AnnotatorMainWindow(QMainWindow):
                 )
             except Exception as exc:
                 QMessageBox.critical(self, "Segmentation failed", str(exc))
-                return
+                return False
 
             if obj_id not in result.obj_ids:
                 continue
             ridx = result.obj_ids.index(obj_id)
-
             obj_output = SamFrameOutput(
                 obj_ids=[obj_id],
                 masks=[result.masks[ridx]],
@@ -932,11 +1106,17 @@ class AnnotatorMainWindow(QMainWindow):
                 scores=[result.scores[ridx]],
             )
             composite = self._merge_frame_outputs(composite, obj_output)
+            if not self._is_current_box_locked(self.current_frame_idx, obj_id):
+                self._sync_canonical_boxes_from_output(self.current_frame_idx, obj_output, preserve_locked=False)
+            refined_any = True
 
-        self.outputs_by_frame[self.current_frame_idx] = composite
-        self.segment_mode = True
-        self.mode_label.setText("Mode: Segment")
+        if refined_any:
+            self.outputs_by_frame[self.current_frame_idx] = composite
+            self.segment_mode = True
+            self.mode_label.setText("Mode: Segment" if self._use_point_prompt_mode() else "Mode: Box Annotation")
+        self._sync_current_box_lock_check()
         self._render_current_frame()
+        return refined_any
 
     def propagate_next_frame(self) -> None:
         if not self._ensure_sam_initialized():
@@ -947,6 +1127,14 @@ class AnnotatorMainWindow(QMainWindow):
         if not enabled_obj_ids:
             QMessageBox.information(self, "No objects enabled", "Check at least one object to propagate.")
             return
+        if self._pending_propagation is None:
+            unlocked_obj_ids = {
+                obj_id for obj_id in enabled_obj_ids
+                if self.box_prompts_by_frame_obj.get(self.current_frame_idx, {}).get(obj_id) is not None
+                and not self._is_current_box_locked(self.current_frame_idx, obj_id)
+            }
+            if unlocked_obj_ids:
+                self._refine_current_frame_boxes(unlocked_obj_ids, show_no_prompts=False)
         if self._pending_propagation is None:
             if self.current_frame_idx >= len(self.frame_paths) - 1:
                 QMessageBox.information(self, "End of video", "Already at last frame.")
@@ -1076,6 +1264,9 @@ class AnnotatorMainWindow(QMainWindow):
             )
             merged_output = self._merge_frame_outputs(existing_output, output)
             self.outputs_by_frame[abs_frame_idx] = merged_output
+            if abs_frame_idx != seed_frame_idx:
+                self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
+                self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
             if self._frame_output_has_masks(output):
                 last_masked_frame_idx = abs_frame_idx
 
@@ -1113,6 +1304,20 @@ class AnnotatorMainWindow(QMainWindow):
             return True
         frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
         return self.active_object_id in frame_boxes
+
+    def _is_current_box_locked(self, frame_idx: int, obj_id: Optional[int]) -> bool:
+        if obj_id is None:
+            return False
+        return self.box_locked_by_frame_obj.get(frame_idx, {}).get(obj_id, False)
+
+    def _set_current_box_locked(self, frame_idx: int, obj_id: int, locked: bool) -> None:
+        frame_map = self.box_locked_by_frame_obj.setdefault(frame_idx, {})
+        if locked:
+            frame_map[obj_id] = True
+            return
+        frame_map.pop(obj_id, None)
+        if not frame_map:
+            self.box_locked_by_frame_obj.pop(frame_idx, None)
 
     def _remove_object_output_from_frame(self, frame_idx: int, obj_id: Optional[int]) -> None:
         if obj_id is None:
@@ -1187,13 +1392,20 @@ class AnnotatorMainWindow(QMainWindow):
         # For carryover chunks, objects without manual prompts fall back to mask-derived carryover prompts.
         prompts_to_apply: Dict[int, List[PointPrompt]] = {}
         boxes_to_apply: Dict[int, BoxPrompt] = {}
+        masks_to_apply: Dict[int, np.ndarray] = {}
         missing_obj_ids: List[int] = []
         for obj_id, points in frame_prompts.items():
             if points and obj_id in enabled_obj_ids:
                 prompts_to_apply[obj_id] = list(points)
-        for obj_id, box in frame_boxes.items():
-            if obj_id in enabled_obj_ids:
-                boxes_to_apply[obj_id] = box
+        for obj_id in enabled_obj_ids:
+            canonical_box = frame_boxes.get(obj_id)
+            if canonical_box is not None:
+                boxes_to_apply[obj_id] = canonical_box
+        seed_output = self.outputs_by_frame.get(seed_frame_idx)
+        if seed_output is not None:
+            for i, obj_id in enumerate(seed_output.obj_ids):
+                if obj_id in enabled_obj_ids and i < len(seed_output.masks):
+                    masks_to_apply[obj_id] = np.asarray(seed_output.masks[i]).astype(np.float32)
 
         if not use_carryover_sampling:
             sampled_boxes = self._sample_boxes_from_seed_masks(seed_frame_idx, h, w)
@@ -1239,6 +1451,7 @@ class AnnotatorMainWindow(QMainWindow):
             return False
 
         obj_ids = set(prompts_to_apply.keys()) | set(boxes_to_apply.keys())
+        obj_ids |= set(masks_to_apply.keys())
         if not obj_ids:
             QMessageBox.information(
                 self,
@@ -1265,6 +1478,7 @@ class AnnotatorMainWindow(QMainWindow):
                     obj_id=obj_id,
                     points_rel=points_rel,
                     labels=labels,
+                    mask_input=masks_to_apply.get(obj_id),
                 )
             except Exception as exc:
                 QMessageBox.critical(self, "Propagation setup failed", str(exc))
@@ -1342,6 +1556,68 @@ class AnnotatorMainWindow(QMainWindow):
             )
         return sampled_boxes
 
+    def _carry_prompts_forward(
+        self,
+        src_frame_idx: int,
+        dst_frame_idx: int,
+        obj_ids: List[int],
+    ) -> None:
+        src_prompts = self.prompts_by_frame_obj.get(src_frame_idx, {})
+        if not src_prompts:
+            return
+        dst_prompts = self.prompts_by_frame_obj.setdefault(dst_frame_idx, {})
+        for obj_id in obj_ids:
+            points = src_prompts.get(obj_id)
+            if not points:
+                continue
+            dst_prompts[obj_id] = [
+                PointPrompt(x_px=p.x_px, y_px=p.y_px, is_positive=p.is_positive)
+                for p in points
+            ]
+
+    def _sync_canonical_boxes_from_output(
+        self,
+        frame_idx: int,
+        output: SamFrameOutput,
+        preserve_locked: bool = True,
+    ) -> None:
+        frame_size = self._get_frame_size(frame_idx)
+        if frame_size is None:
+            return
+        width, height = frame_size
+        frame_boxes = self.box_prompts_by_frame_obj.setdefault(frame_idx, {})
+        for i, obj_id in enumerate(output.obj_ids):
+            if i >= len(output.boxes_xywh_norm):
+                continue
+            if preserve_locked and self._is_current_box_locked(frame_idx, obj_id):
+                continue
+            box = self._box_from_norm(output.boxes_xywh_norm[i], width, height)
+            if box is None:
+                continue
+            frame_boxes[obj_id] = box
+            self._set_current_box_locked(frame_idx, obj_id, False)
+
+    def _box_from_norm(
+        self,
+        box_xywh_norm: Tuple[float, float, float, float],
+        width: int,
+        height: int,
+    ) -> Optional[BoxPrompt]:
+        x_norm, y_norm, w_norm, h_norm = box_xywh_norm
+        x1 = int(round(x_norm * width))
+        y1 = int(round(y_norm * height))
+        box_w = int(round(w_norm * width))
+        box_h = int(round(h_norm * height))
+        x2 = x1 + box_w
+        y2 = y1 + box_h
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(0, min(width - 1, x2))
+        y2 = max(0, min(height - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return BoxPrompt(x1_px=x1, y1_px=y1, x2_px=x2, y2_px=y2)
+
     def _clear_pending_propagation_state(self) -> None:
         self._pending_propagation = None
         self.propagate_btn.setText("Propagate")
@@ -1400,8 +1676,7 @@ class AnnotatorMainWindow(QMainWindow):
         if self.current_frame_idx in self.outputs_by_frame:
             img = self._draw_output_overlay(img, self.outputs_by_frame[self.current_frame_idx])
 
-        if self.show_prompts:
-            img = self._draw_points_overlay(img)
+        img = self._draw_points_overlay(img)
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
@@ -1437,6 +1712,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.frame_label.setText(f"Frame: {self.current_frame_idx + 1}/{len(self.frame_paths)}")
         self._sync_frame_navigation_controls()
         self.refresh_point_list()
+        self._sync_current_box_lock_check()
 
     def _draw_output_overlay(self, img: np.ndarray, output: SamFrameOutput) -> np.ndarray:
         overlay = img.copy()
@@ -1457,61 +1733,49 @@ class AnnotatorMainWindow(QMainWindow):
                 blended = cv2.addWeighted(overlay, 1.0 - mask_alpha, color_img, mask_alpha, 0)
                 overlay = np.where(mask[..., None].astype(bool), blended, overlay)
 
-            x_norm, y_norm, w_norm, h_norm = output.boxes_xywh_norm[i]
-            x = int(x_norm * w)
-            y = int(y_norm * h)
-            bw = int(w_norm * w)
-            bh = int(h_norm * h)
-            if self.show_boxes:
-                self._draw_box_outline(
-                    overlay,
-                    BoxPrompt(x1_px=x, y1_px=y, x2_px=x + bw, y2_px=y + bh),
-                    color,
-                    self.box_line_thickness,
-                    dashed=False,
-                )
+        return overlay
 
-            score = output.scores[i] if i < len(output.scores) else 0.0
-            label = f"{obj.name if obj else obj_id} {score:.2f}"
+    def _draw_points_overlay(self, img: np.ndarray) -> np.ndarray:
+        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+        for obj_id, box in frame_boxes.items():
+            obj = self._find_object(obj_id)
+            color = obj.color_bgr if obj else (255, 255, 255)
             if self.show_boxes:
+                self._draw_box_outline(img, box, color, self.box_line_thickness, dashed=False)
+                label = obj.name if obj else str(obj_id)
+                if self._is_current_box_locked(self.current_frame_idx, obj_id):
+                    label += " [L]"
                 cv2.putText(
-                    overlay,
+                    img,
                     label,
-                    (x, max(20, y - 6)),
+                    (box.x1_px, max(20, box.y1_px - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     color,
                     self.box_line_thickness,
                     cv2.LINE_AA,
                 )
-
-        return overlay
-
-    def _draw_points_overlay(self, img: np.ndarray) -> np.ndarray:
-        frame_map = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
-        for obj_id, plist in frame_map.items():
-            obj = self._find_object(obj_id)
-            color = obj.color_bgr if obj else (255, 255, 255)
-            for p in plist:
-                radius = 6
-                if p.is_positive:
-                    cv2.circle(img, (p.x_px, p.y_px), radius, color, -1)
-                else:
-                    cv2.circle(img, (p.x_px, p.y_px), radius, color, 2)
-                    cv2.line(img, (p.x_px - radius, p.y_px - radius), (p.x_px + radius, p.y_px + radius), color, 2)
-                    cv2.line(img, (p.x_px - radius, p.y_px + radius), (p.x_px + radius, p.y_px - radius), color, 2)
-        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
-        for obj_id, box in frame_boxes.items():
-            obj = self._find_object(obj_id)
-            color = obj.color_bgr if obj else (255, 255, 255)
-            self._draw_box_outline(img, box, color, 2, dashed=True)
-            if self._should_draw_box_handles(obj_id):
+            if self.show_boxes and self._should_draw_box_handles(obj_id):
                 self._draw_box_handles(img, box, color)
+
+        if self.show_prompts:
+            frame_map = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
+            for obj_id, plist in frame_map.items():
+                obj = self._find_object(obj_id)
+                color = obj.color_bgr if obj else (255, 255, 255)
+                for p in plist:
+                    radius = 6
+                    if p.is_positive:
+                        cv2.circle(img, (p.x_px, p.y_px), radius, color, -1)
+                    else:
+                        cv2.circle(img, (p.x_px, p.y_px), radius, color, 2)
+                        cv2.line(img, (p.x_px - radius, p.y_px - radius), (p.x_px + radius, p.y_px + radius), color, 2)
+                        cv2.line(img, (p.x_px - radius, p.y_px + radius), (p.x_px + radius, p.y_px - radius), color, 2)
 
         return img
 
     def _is_box_mode(self) -> bool:
-        return self.prompt_mode_combo.currentIndex() == 2
+        return not self._use_point_prompt_mode()
 
     def _begin_box_interaction(
         self,
@@ -1930,9 +2194,12 @@ class AnnotatorMainWindow(QMainWindow):
             self._render_current_frame()
 
     def _get_current_frame_size(self) -> Optional[Tuple[int, int]]:
-        if not self.frame_paths:
+        return self._get_frame_size(self.current_frame_idx)
+
+    def _get_frame_size(self, frame_idx: int) -> Optional[Tuple[int, int]]:
+        if not self.frame_paths or frame_idx < 0 or frame_idx >= len(self.frame_paths):
             return None
-        frame = cv2.imread(str(self.frame_paths[self.current_frame_idx]))
+        frame = cv2.imread(str(self.frame_paths[frame_idx]))
         if frame is None:
             return None
         h, w = frame.shape[:2]
