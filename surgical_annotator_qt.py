@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from PIL import Image as PilImage
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, Signal, Slot, QEventLoop, QMetaObject, Q_ARG
 from PySide6.QtGui import QAction, QBrush, QColor, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,12 +29,14 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QRubberBand,
     QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -87,6 +91,294 @@ class PendingPropagationState:
     completed_chunks: int = 0
 
 
+class PropagationWorker(QObject):
+    frame_ready = Signal(int, object, int, int)
+    chunk_done = Signal(int, int, int)
+    failed = Signal(str, bool)
+    finished = Signal()
+
+    def __init__(
+        self,
+        sam_adapter: "Sam3Adapter",
+        frame_paths: List[Path],
+        seed_frame_idx: int,
+        n_frames: int,
+        chunk_idx: int,
+        prompt_payload: Dict[int, Dict[str, object]],
+        sam_lock: Optional[threading.Lock] = None,
+    ) -> None:
+        super().__init__()
+        self.sam_adapter = sam_adapter
+        self.frame_paths = frame_paths
+        self.seed_frame_idx = seed_frame_idx
+        self.n_frames = n_frames
+        self.chunk_idx = chunk_idx
+        self.prompt_payload = prompt_payload
+        self.sam_lock = sam_lock
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            abs_start = self.seed_frame_idx
+            abs_end = min(abs_start + self.n_frames, len(self.frame_paths))
+            actual_n = abs_end - abs_start
+            if actual_n <= 1:
+                self.failed.emit("No forward frames available from current seed frame.", True)
+                return
+
+            lock = self.sam_lock
+            if lock is None:
+                lock_ctx = None
+            else:
+                lock_ctx = lock
+            if lock_ctx:
+                lock_ctx.acquire()
+            try:
+                imgs_pil = [PilImage.open(str(self.frame_paths[i])) for i in range(abs_start, abs_end)]
+                self.sam_adapter.start_session(imgs_pil)
+
+                for obj_id, payload in self.prompt_payload.items():
+                    points_rel = payload.get("points_rel", [])
+                    labels = payload.get("labels", [])
+                    mask_input = payload.get("mask_input")
+                    if not points_rel:
+                        continue
+                    self.sam_adapter.add_object_points(
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        points_rel=points_rel,
+                        labels=labels,
+                        mask_input=mask_input,
+                    )
+
+                session_outputs = self.sam_adapter.propagate_n_frames(
+                    start_frame_idx=0,
+                    max_frames=actual_n,
+                )
+            finally:
+                if lock_ctx:
+                    lock_ctx.release()
+
+            last_masked_frame_idx: Optional[int] = None
+            for session_idx, output in session_outputs.items():
+                abs_frame_idx = abs_start + session_idx
+                self.frame_ready.emit(abs_frame_idx, output, int(session_idx), actual_n)
+                for mask in output.masks:
+                    if np.asarray(mask).any():
+                        last_masked_frame_idx = abs_frame_idx
+                        break
+
+            if last_masked_frame_idx is None:
+                self.failed.emit(
+                    "Chunk produced no valid masks. Please refine prompts and run again.",
+                    True,
+                )
+                return
+
+            self.chunk_done.emit(self.chunk_idx, last_masked_frame_idx, abs_end - 1)
+        except Exception as exc:
+            self.failed.emit(str(exc), False)
+        finally:
+            self.finished.emit()
+
+
+class SamWorker(QObject):
+    initialized = Signal(bool, str)
+    segment_done = Signal(str, int, object)
+    propagate_frame = Signal(str, int, object, int, int)
+    propagate_done = Signal(str, int, int)
+    task_failed = Signal(str, str, bool)
+    task_finished = Signal(str)
+
+    def __init__(self, checkpoint_path: Optional[str], bpe_path: Optional[str]) -> None:
+        super().__init__()
+        self.checkpoint_path = checkpoint_path
+        self.bpe_path = bpe_path
+        self.sam_adapter: Optional[Sam3Adapter] = None
+        self._queue = deque()
+        self._busy = False
+        self._cancel_prefetch = False
+
+    @Slot()
+    def initialize(self) -> None:
+        try:
+            self.sam_adapter = Sam3Adapter(
+                checkpoint_path=self.checkpoint_path,
+                bpe_path=self.bpe_path,
+            )
+        except Exception as exc:
+            self.sam_adapter = None
+            self.initialized.emit(False, str(exc))
+            return
+        self.initialized.emit(True, "")
+
+    @Slot(str, str, object, bool)
+    def enqueue_task(self, task_id: str, task_type: str, payload: object, priority: bool = False) -> None:
+        if priority:
+            self._queue.appendleft((task_id, task_type, payload))
+        else:
+            self._queue.append((task_id, task_type, payload))
+        if not self._busy:
+            self._process_next()
+
+    @Slot()
+    def cancel_prefetch(self) -> None:
+        self._cancel_prefetch = True
+
+    def _process_next(self) -> None:
+        if not self._queue:
+            self._busy = False
+            return
+        self._busy = True
+        task_id, task_type, payload = self._queue.popleft()
+        try:
+            if self.sam_adapter is None:
+                self.task_failed.emit(task_id, "SAM3 not initialized.", False)
+            elif task_type == "close_session":
+                self.sam_adapter.close_session()
+                self.task_finished.emit(task_id)
+            elif task_type == "segment":
+                self._run_segment(task_id, payload)
+            elif task_type in {"propagate", "prefetch"}:
+                self._run_propagate(task_id, payload, task_type == "prefetch")
+            else:
+                self.task_failed.emit(task_id, f"Unknown task type: {task_type}", False)
+        except Exception as exc:
+            self.task_failed.emit(task_id, str(exc), False)
+        finally:
+            QMetaObject.invokeMethod(self, "_finish_task", Qt.QueuedConnection)
+
+    @Slot()
+    def _finish_task(self) -> None:
+        self._busy = False
+        self._process_next()
+
+    def _run_segment(self, task_id: str, payload: object) -> None:
+        data = payload or {}
+        frame_idx = int(data.get("frame_idx", -1))
+        obj_payload = data.get("payload", {})
+        if frame_idx < 0:
+            self.task_failed.emit(task_id, "Invalid frame index.", False)
+            return
+        if not obj_payload:
+            self.task_failed.emit(task_id, "No prompts to segment.", True)
+            return
+        img_path = data.get("frame_path")
+        if not img_path:
+            self.task_failed.emit(task_id, "Missing frame path.", False)
+            return
+        img_pil = PilImage.open(str(img_path))
+        self.sam_adapter.start_session([img_pil])
+        composite = SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[])
+        for obj_id, p in obj_payload.items():
+            points_rel = p.get("points_rel", [])
+            labels = p.get("labels", [])
+            if not points_rel:
+                continue
+            result = self.sam_adapter.add_object_points(
+                frame_idx=0,
+                obj_id=int(obj_id),
+                points_rel=points_rel,
+                labels=labels,
+            )
+            if int(obj_id) not in result.obj_ids:
+                continue
+            ridx = result.obj_ids.index(int(obj_id))
+            obj_output = SamFrameOutput(
+                obj_ids=[int(obj_id)],
+                masks=[result.masks[ridx]],
+                boxes_xywh_norm=[result.boxes_xywh_norm[ridx]],
+                scores=[result.scores[ridx]],
+            )
+            composite = _merge_outputs_for_worker(composite, obj_output)
+        self.segment_done.emit(task_id, frame_idx, composite)
+
+    def _run_propagate(self, task_id: str, payload: object, is_prefetch: bool) -> None:
+        data = payload or {}
+        seed_frame_idx = int(data.get("seed_frame_idx", -1))
+        n_frames = int(data.get("n_frames", 0))
+        frame_paths = data.get("frame_paths", [])
+        prompt_payload = data.get("prompt_payload", {})
+        if seed_frame_idx < 0 or n_frames <= 1:
+            self.task_failed.emit(task_id, "No forward frames available from current seed frame.", True)
+            return
+        abs_start = seed_frame_idx
+        abs_end = min(abs_start + n_frames, len(frame_paths))
+        actual_n = abs_end - abs_start
+        if actual_n <= 1:
+            self.task_failed.emit(task_id, "No forward frames available from current seed frame.", True)
+            return
+
+        imgs_pil = [PilImage.open(str(frame_paths[i])) for i in range(abs_start, abs_end)]
+        self.sam_adapter.start_session(imgs_pil)
+        for obj_id, p in prompt_payload.items():
+            points_rel = p.get("points_rel", [])
+            labels = p.get("labels", [])
+            mask_input = p.get("mask_input")
+            if not points_rel:
+                continue
+            self.sam_adapter.add_object_points(
+                frame_idx=0,
+                obj_id=int(obj_id),
+                points_rel=points_rel,
+                labels=labels,
+                mask_input=mask_input,
+            )
+
+        session_outputs = self.sam_adapter.propagate_n_frames(
+            start_frame_idx=0,
+            max_frames=actual_n,
+        )
+        last_masked_frame_idx: Optional[int] = None
+        for session_idx, output in session_outputs.items():
+            if is_prefetch and self._cancel_prefetch:
+                continue
+            abs_frame_idx = abs_start + int(session_idx)
+            self.propagate_frame.emit(task_id, abs_frame_idx, output, int(session_idx), actual_n)
+            for mask in output.masks:
+                if np.asarray(mask).any():
+                    last_masked_frame_idx = abs_frame_idx
+                    break
+
+        if is_prefetch:
+            self._cancel_prefetch = False
+
+        if last_masked_frame_idx is None:
+            self.task_failed.emit(
+                task_id,
+                "Chunk produced no valid masks. Please refine prompts and run again.",
+                True,
+            )
+            return
+        self.propagate_done.emit(task_id, last_masked_frame_idx, abs_end - 1)
+
+
+def _merge_outputs_for_worker(base_output: SamFrameOutput, new_output: SamFrameOutput) -> SamFrameOutput:
+    merged = SamFrameOutput(
+        obj_ids=list(base_output.obj_ids),
+        masks=list(base_output.masks),
+        boxes_xywh_norm=list(base_output.boxes_xywh_norm),
+        scores=list(base_output.scores),
+    )
+    obj_to_idx = {obj_id: i for i, obj_id in enumerate(merged.obj_ids)}
+    for i, obj_id in enumerate(new_output.obj_ids):
+        if i >= len(new_output.masks) or i >= len(new_output.boxes_xywh_norm):
+            continue
+        score = new_output.scores[i] if i < len(new_output.scores) else 0.0
+        if obj_id in obj_to_idx:
+            idx = obj_to_idx[obj_id]
+            merged.masks[idx] = new_output.masks[i]
+            merged.boxes_xywh_norm[idx] = new_output.boxes_xywh_norm[i]
+            merged.scores[idx] = score
+        else:
+            merged.obj_ids.append(obj_id)
+            merged.masks.append(new_output.masks[i])
+            merged.boxes_xywh_norm.append(new_output.boxes_xywh_norm[i])
+            merged.scores.append(score)
+            obj_to_idx[obj_id] = len(merged.obj_ids) - 1
+    return merged
+
+
 class ClickableImageLabel(QLabel):
     def __init__(self, parent: "AnnotatorMainWindow"):
         super().__init__()
@@ -96,7 +388,7 @@ class ClickableImageLabel(QLabel):
         self.setMinimumSize(1, 1)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setScaledContents(False)
-        self.setStyleSheet("background-color: #111; border: 1px solid #444;")
+        self.setStyleSheet("background-color: #111; border: 1px solid #444; color: #ddd;")
         self.setMouseTracking(True)
 
     def sizeHint(self):
@@ -114,6 +406,7 @@ class ClickableImageLabel(QLabel):
         if event.buttons() & Qt.RightButton:
             self.parent_window.on_pan_drag(event.position().x(), event.position().y())
             return
+        self.parent_window.on_image_hover(event.position().x(), event.position().y())
         self.parent_window.on_image_drag(event.position().x(), event.position().y())
 
     def mouseReleaseEvent(self, event):
@@ -123,6 +416,9 @@ class ClickableImageLabel(QLabel):
         if event.button() != Qt.LeftButton:
             return
         self.parent_window.on_image_release(event.position().x(), event.position().y())
+
+    def leaveEvent(self, _event):
+        self.parent_window.on_image_hover(None, None)
 
     def wheelEvent(self, event):
         self.parent_window.on_image_wheel(
@@ -233,6 +529,7 @@ class Sam3Adapter:
 
 
 class AnnotatorMainWindow(QMainWindow):
+    task_requested = Signal(str, str, object, bool)
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SAM3 Surgical Video Annotator")
@@ -265,6 +562,34 @@ class AnnotatorMainWindow(QMainWindow):
         self._pan_offset_ui: Tuple[float, float] = (0.0, 0.0)
         self._pan_drag_last_ui_xy: Optional[Tuple[float, float]] = None
         self._pending_propagation: Optional[PendingPropagationState] = None
+        self._propagation_thread: Optional[QThread] = None
+        self._propagation_worker: Optional[PropagationWorker] = None
+        self._propagation_busy: bool = False
+        self._propagation_enabled_obj_ids: Optional[set[int]] = None
+        self._propagation_view_frame_idx: Optional[int] = None
+        self._propagation_continue_after_chunk: bool = False
+        self._propagation_active_chunk_idx: Optional[int] = None
+        self._propagation_active_seed_frame_idx: Optional[int] = None
+        self._propagation_task_id: Optional[str] = None
+        self._sam_thread: Optional[QThread] = None
+        self._sam_worker: Optional[SamWorker] = None
+        self._sam_ready: bool = False
+        self._sam_task_counter: int = 0
+        self._sam_task_contexts: Dict[str, Dict[str, object]] = {}
+        self._sam_waiting: Dict[str, QEventLoop] = {}
+        self._sam_task_results: Dict[str, object] = {}
+        self._prefetch_thread: Optional[QThread] = None
+        self._prefetch_worker: Optional[PropagationWorker] = None
+        self._prefetch_busy: bool = False
+        self._prefetch_cancel_requested: bool = False
+        self._prefetch_pending_restart: bool = False
+        self._prefetch_target_frame_idx: Optional[int] = None
+        self._prefetch_seed_frame_idx: Optional[int] = None
+        self._prefetch_prompt_version: int = 0
+        self._prefetch_active_version: Optional[int] = None
+        self._prefetch_cached_frame_idx: Optional[int] = None
+        self._prefetch_cached_seed_idx: Optional[int] = None
+        self._prefetch_cached_version: Optional[int] = None
         self._box_draw_start_xy: Optional[Tuple[int, int]] = None
         self._box_draw_start_ui_xy: Optional[Tuple[int, int]] = None
         self._box_edit_active: bool = False
@@ -277,11 +602,11 @@ class AnnotatorMainWindow(QMainWindow):
         self.show_segmentations: bool = True
         self.show_boxes: bool = True
         self.auto_propagate_next: bool = False
+        self.translate_prompts_on_propagation: bool = True
         self.segmentation_opacity: float = 0.6
         self.box_line_thickness: int = 2
 
         self._setup_ui()
-        self._initialize_sam_adapter(show_errors=False)
 
     def _setup_ui(self) -> None:
         load_action = QAction("Load Frame Directory", self)
@@ -298,8 +623,11 @@ class AnnotatorMainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         root_layout.addWidget(splitter)
 
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
+        left_placeholder = QWidget()
+        left_placeholder.setMinimumWidth(200)
+
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
 
         nav_row = QHBoxLayout()
         self.prev_btn = QPushButton("Prev")
@@ -326,14 +654,21 @@ class AnnotatorMainWindow(QMainWindow):
         nav_row.addWidget(QLabel("Go to:"))
         nav_row.addWidget(self.frame_jump_spin)
         nav_row.addWidget(self.frame_label)
-        left_layout.addLayout(nav_row)
+        center_layout.addLayout(nav_row)
 
         self.image_label = ClickableImageLabel(self)
-        left_layout.addWidget(self.image_label)
+        center_layout.addWidget(self.image_label)
         self._box_rubber_band = QRubberBand(QRubberBand.Rectangle, self.image_label)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+        control_tabs = QTabWidget()
+        right_layout.addWidget(control_tabs)
+
+        prompt_tab = QWidget()
+        prompt_layout = QVBoxLayout(prompt_tab)
+        processing_tab = QWidget()
+        processing_layout = QVBoxLayout(processing_tab)
 
         model_form = QFormLayout()
         self.checkpoint_combo = QComboBox()
@@ -347,14 +682,14 @@ class AnnotatorMainWindow(QMainWindow):
         self.bpe_combo.setEditable(True)
         self.bpe_combo.lineEdit().setPlaceholderText("Optional local BPE path")
         model_form.addRow("BPE", self.bpe_combo)
-        right_layout.addLayout(model_form)
+        prompt_layout.addLayout(model_form)
 
         self.object_list = QListWidget()
         self.object_list.currentItemChanged.connect(self._on_object_selection_changed)
-        right_layout.addWidget(QLabel("Objects"))
-        right_layout.addWidget(self.object_list)
+        prompt_layout.addWidget(QLabel("Objects"))
+        prompt_layout.addWidget(self.object_list)
         self.active_object_label = QLabel("Active: None")
-        right_layout.addWidget(self.active_object_label)
+        prompt_layout.addWidget(self.active_object_label)
 
         obj_row = QHBoxLayout()
         self.add_obj_btn = QPushButton("Add Object")
@@ -363,27 +698,33 @@ class AnnotatorMainWindow(QMainWindow):
         self.remove_obj_btn.clicked.connect(self.remove_active_object)
         obj_row.addWidget(self.add_obj_btn)
         obj_row.addWidget(self.remove_obj_btn)
-        right_layout.addLayout(obj_row)
+        prompt_layout.addLayout(obj_row)
 
         self.auto_propagate_next_check = QCheckBox("Auto Propagate Next Frame")
         self.auto_propagate_next_check.toggled.connect(self._on_auto_propagate_next_toggled)
-        right_layout.addWidget(self.auto_propagate_next_check)
+        processing_layout.addWidget(self.auto_propagate_next_check)
+
+        self.translate_prompts_check = QCheckBox("Translate Point Prompts on Propagation")
+        self.translate_prompts_check.setChecked(self.translate_prompts_on_propagation)
+        self.translate_prompts_check.toggled.connect(self._on_translate_prompts_toggled)
+        processing_layout.addWidget(self.translate_prompts_check)
 
         self.prompt_mode_label = QLabel("Advanced Prompt Mode")
-        right_layout.addWidget(self.prompt_mode_label)
+        prompt_layout.addWidget(self.prompt_mode_label)
         self.prompt_mode_combo = QComboBox()
         self.prompt_mode_combo.addItems(["Positive (+)", "Negative (-)", "Box (drag)"])
         self.prompt_mode_combo.setCurrentIndex(2)
         self.prompt_mode_combo.currentIndexChanged.connect(self._on_prompt_mode_changed)
-        right_layout.addWidget(self.prompt_mode_combo)
+        prompt_layout.addWidget(self.prompt_mode_combo)
 
         self.annotation_list_label = QLabel("Current Frame Annotations")
-        right_layout.addWidget(self.annotation_list_label)
+        prompt_layout.addWidget(self.annotation_list_label)
         self.lock_current_box_check = QCheckBox("Lock Current Box")
         self.lock_current_box_check.toggled.connect(self._on_lock_current_box_toggled)
-        right_layout.addWidget(self.lock_current_box_check)
+        prompt_layout.addWidget(self.lock_current_box_check)
         self.point_list = QListWidget()
-        right_layout.addWidget(self.point_list)
+        self.point_list.currentRowChanged.connect(self._on_point_list_selection_changed)
+        prompt_layout.addWidget(self.point_list)
 
         point_row = QHBoxLayout()
         self.remove_point_btn = QPushButton("Remove Selected Prompt")
@@ -392,31 +733,31 @@ class AnnotatorMainWindow(QMainWindow):
         self.clear_points_btn.clicked.connect(self.clear_active_object_prompts)
         point_row.addWidget(self.remove_point_btn)
         point_row.addWidget(self.clear_points_btn)
-        right_layout.addLayout(point_row)
+        prompt_layout.addLayout(point_row)
 
         self.segment_btn = QPushButton("Segment")
         self.segment_btn.clicked.connect(self.segment_current_frame)
-        right_layout.addWidget(self.segment_btn)
+        processing_layout.addWidget(self.segment_btn)
 
         self.advanced_controls_check = QCheckBox("Show Advanced Prompt Controls")
         self.advanced_controls_check.toggled.connect(self._on_advanced_controls_toggled)
-        right_layout.addWidget(self.advanced_controls_check)
+        prompt_layout.addWidget(self.advanced_controls_check)
 
-        right_layout.addWidget(QLabel("View"))
+        processing_layout.addWidget(QLabel("View"))
         self.show_prompts_check = QCheckBox("Show Prompts")
         self.show_prompts_check.setChecked(self.show_prompts)
         self.show_prompts_check.toggled.connect(self._on_view_settings_changed)
-        right_layout.addWidget(self.show_prompts_check)
+        processing_layout.addWidget(self.show_prompts_check)
 
         self.show_segmentations_check = QCheckBox("Show Segmentations")
         self.show_segmentations_check.setChecked(self.show_segmentations)
         self.show_segmentations_check.toggled.connect(self._on_view_settings_changed)
-        right_layout.addWidget(self.show_segmentations_check)
+        processing_layout.addWidget(self.show_segmentations_check)
 
         self.show_boxes_check = QCheckBox("Show Boxes")
         self.show_boxes_check.setChecked(self.show_boxes)
         self.show_boxes_check.toggled.connect(self._on_view_settings_changed)
-        right_layout.addWidget(self.show_boxes_check)
+        processing_layout.addWidget(self.show_boxes_check)
 
         view_form = QFormLayout()
         self.segmentation_opacity_spin = QDoubleSpinBox()
@@ -434,7 +775,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_line_thickness_spin.setValue(self.box_line_thickness)
         self.box_line_thickness_spin.valueChanged.connect(self._on_view_settings_changed)
         view_form.addRow("Box thickness", self.box_line_thickness_spin)
-        right_layout.addLayout(view_form)
+        processing_layout.addLayout(view_form)
 
         propagate_row = QHBoxLayout()
         self.propagate_btn = QPushButton("Propagate")
@@ -469,11 +810,15 @@ class AnnotatorMainWindow(QMainWindow):
         propagate_row.addWidget(QLabel("Carryover:"))
         propagate_row.addWidget(self.carryover_mode_combo)
         propagate_row.addWidget(self.pause_between_chunks_check)
-        right_layout.addLayout(propagate_row)
+        processing_layout.addLayout(propagate_row)
 
         self.mode_label = QLabel("Mode: Prompt")
-        right_layout.addWidget(self.mode_label)
-        right_layout.addStretch(1)
+        processing_layout.addWidget(self.mode_label)
+        prompt_layout.addStretch(1)
+        processing_layout.addStretch(1)
+
+        control_tabs.addTab(prompt_tab, "Prompting")
+        control_tabs.addTab(processing_tab, "Segment / Propagate")
 
         self._advanced_widgets = [
             self.prompt_mode_label,
@@ -484,19 +829,34 @@ class AnnotatorMainWindow(QMainWindow):
         self._set_advanced_controls_visible(False)
         self.mode_label.setText("Mode: Box Annotation")
 
-        splitter.addWidget(left_panel)
+        splitter.addWidget(left_placeholder)
+        splitter.addWidget(center_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([1100, 500])
+        splitter.setSizes([200, 1100, 500])
 
         self.setCentralWidget(root)
         self._setup_shortcuts()
-        self.statusBar().showMessage("Load a frame directory to start")
+        self._status_label = QLabel("Load a frame directory to start")
+        self._status_progress = QProgressBar()
+        self._status_progress.setMinimumWidth(200)
+        self._status_progress.setRange(0, 1)
+        self._status_progress.setValue(0)
+        self._coords_label = QLabel("")
+        self._coords_label.setMinimumWidth(160)
+        self.statusBar().addWidget(self._status_label, 1)
+        self.statusBar().addWidget(self._coords_label)
+        self.statusBar().addPermanentWidget(self._status_progress)
 
     def _on_prompt_mode_changed(self, idx: int) -> None:
         self.current_prompt_positive = idx == 0
 
     def _on_auto_propagate_next_toggled(self, checked: bool) -> None:
         self.auto_propagate_next = checked
+        if not checked:
+            self._cancel_prefetch(restart=False)
+
+    def _on_translate_prompts_toggled(self, checked: bool) -> None:
+        self.translate_prompts_on_propagation = checked
 
     def _on_lock_current_box_toggled(self, checked: bool) -> None:
         if self.active_object_id is None:
@@ -573,6 +933,154 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_line_thickness = int(self.box_line_thickness_spin.value())
         self._render_current_frame()
 
+    def _on_point_list_selection_changed(self, _row: int) -> None:
+        if self.frame_paths:
+            self._render_current_frame()
+
+    def _set_status(self, text: str, *, progress: Optional[int] = None, total: Optional[int] = None, indeterminate: bool = False) -> None:
+        self._status_label.setText(text)
+        if indeterminate:
+            self._status_progress.setRange(0, 0)
+            return
+        if total is not None:
+            self._status_progress.setRange(0, max(1, total))
+        if progress is not None:
+            self._status_progress.setValue(progress)
+
+    def _on_sam_worker_initialized(self, ok: bool, message: str) -> None:
+        self._sam_ready = ok
+        self._sam_init_error = message
+        loop = self._sam_waiting.get("__init__")
+        if loop is not None:
+            loop.quit()
+
+    def _enqueue_sam_task(self, task_type: str, payload: Dict[str, object], priority: bool = False) -> str:
+        self._sam_task_counter += 1
+        task_id = f"{task_type}:{self._sam_task_counter}"
+        if self._sam_worker is None:
+            return task_id
+        self.task_requested.emit(task_id, task_type, payload, priority)
+        return task_id
+
+    def _wait_for_sam_task(self, task_id: str) -> object:
+        loop = QEventLoop()
+        self._sam_waiting[task_id] = loop
+        loop.exec()
+        self._sam_waiting.pop(task_id, None)
+        return self._sam_task_results.pop(task_id, None)
+
+    def _reset_prefetch_state(self) -> None:
+        self._cancel_prefetch(restart=False)
+        self._prefetch_prompt_version = 0
+        self._prefetch_cached_frame_idx = None
+        self._prefetch_cached_seed_idx = None
+        self._prefetch_cached_version = None
+
+    def _note_prompt_change_and_prefetch(self) -> None:
+        self._prefetch_prompt_version += 1
+        self._prefetch_cached_frame_idx = None
+        self._prefetch_cached_seed_idx = None
+        self._prefetch_cached_version = None
+        self._schedule_prefetch_for_next_frame()
+
+    def _has_valid_prefetch(self, target_frame_idx: int) -> bool:
+        return (
+            self._prefetch_cached_frame_idx == target_frame_idx
+            and self._prefetch_cached_seed_idx == target_frame_idx - 1
+            and self._prefetch_cached_version == self._prefetch_prompt_version
+        )
+
+    def _cancel_prefetch(self, *, restart: bool) -> None:
+        if not self._prefetch_busy:
+            self._prefetch_pending_restart = False
+            return
+        self._prefetch_cancel_requested = True
+        self._prefetch_pending_restart = restart
+        if self._sam_worker is not None:
+            QMetaObject.invokeMethod(self._sam_worker, "cancel_prefetch", Qt.QueuedConnection)
+
+
+    def _schedule_prefetch_for_next_frame(self) -> None:
+        if not self.auto_propagate_next:
+            return
+        if self._propagation_busy:
+            return
+        if not self.frame_paths or self.current_frame_idx >= len(self.frame_paths) - 1:
+            return
+        if self._has_valid_prefetch(self.current_frame_idx + 1):
+            return
+        if self._prefetch_busy:
+            self._cancel_prefetch(restart=True)
+            return
+        if not self._ensure_sam_initialized():
+            return
+
+        enabled_obj_ids = self._get_enabled_propagation_obj_ids()
+        if not enabled_obj_ids:
+            return
+        prompt_payload = self._build_seed_prompts(
+            seed_frame_idx=self.current_frame_idx,
+            use_carryover_sampling=False,
+            sample_points_per_object=self.sample_points_spin.value(),
+            carryover_mode=self.carryover_mode_combo.currentText(),
+            enabled_obj_ids=enabled_obj_ids,
+        )
+        if prompt_payload is None:
+            return
+
+        target_frame_idx = self.current_frame_idx + 1
+        self._prefetch_busy = True
+        self._prefetch_cancel_requested = False
+        self._prefetch_pending_restart = False
+        self._prefetch_target_frame_idx = target_frame_idx
+        self._prefetch_seed_frame_idx = self.current_frame_idx
+        self._prefetch_active_version = self._prefetch_prompt_version
+
+        task_id = self._enqueue_sam_task(
+            "prefetch",
+            {
+                "seed_frame_idx": self.current_frame_idx,
+                "n_frames": 2,
+                "frame_paths": self.frame_paths,
+                "prompt_payload": prompt_payload,
+            },
+        )
+        self._sam_task_contexts[task_id] = {
+            "kind": "prefetch",
+            "target_frame_idx": target_frame_idx,
+            "seed_frame_idx": self.current_frame_idx,
+            "version": self._prefetch_prompt_version,
+        }
+
+    def on_image_hover(self, ui_x: Optional[float], ui_y: Optional[float]) -> None:
+        if ui_x is None or ui_y is None or not self.frame_paths:
+            self._coords_label.setText("")
+            return
+        mapped = self._map_ui_to_image_xy(ui_x, ui_y)
+        if mapped is None:
+            self._coords_label.setText("")
+            return
+        x_img, y_img = mapped
+        self._coords_label.setText(f"X: {x_img}  Y: {y_img}")
+
+    def _set_propagation_ui_enabled(self, enabled: bool) -> None:
+        self.propagate_btn.setEnabled(enabled)
+        self.segment_btn.setEnabled(enabled)
+        self.add_obj_btn.setEnabled(enabled)
+        self.remove_obj_btn.setEnabled(enabled)
+        self.object_list.setEnabled(enabled)
+        self.point_list.setEnabled(enabled)
+        self.remove_point_btn.setEnabled(enabled)
+        self.clear_points_btn.setEnabled(enabled)
+        self.lock_current_box_check.setEnabled(enabled)
+        self.prompt_mode_combo.setEnabled(enabled)
+        self.advanced_controls_check.setEnabled(enabled)
+        self.prev_btn.setEnabled(enabled)
+        self.next_btn.setEnabled(enabled)
+        self.fit_view_btn.setEnabled(enabled)
+        self.frame_slider.setEnabled(enabled)
+        self.frame_jump_spin.setEnabled(enabled)
+
     def _sync_current_box_lock_check(self) -> None:
         has_box = False
         checked = False
@@ -593,22 +1101,20 @@ class AnnotatorMainWindow(QMainWindow):
         if not directory:
             return
 
+        self._set_status("Loading frames...", indeterminate=True)
         dir_path = Path(directory)
         frame_paths = sorted([p for p in dir_path.iterdir() if p.suffix.lower() in IMAGE_EXTS])
         if not frame_paths:
             QMessageBox.warning(self, "No frames", "Selected directory has no supported image files.")
+            self._set_status("No supported images found.", progress=0, total=1)
             return
 
         self._checkpoint_path = self._read_optional_combo_path(self.checkpoint_combo)
         self._bpe_path = self._read_optional_combo_path(self.bpe_combo)
 
-        if self.sam_adapter is not None:
-            try:
-                self.sam_adapter.close_session()
-            except Exception:
-                pass
-            self.sam_adapter = None
-        self._initialize_sam_adapter(show_errors=True)
+        if not self._initialize_sam_worker(show_errors=True):
+            return
+        self._enqueue_sam_task("close_session", {}, priority=True)
 
         self.image_dir = dir_path
         self.frame_paths = frame_paths
@@ -647,7 +1153,8 @@ class AnnotatorMainWindow(QMainWindow):
         self._sync_current_box_lock_check()
 
         self._render_current_frame()
-        self.statusBar().showMessage(f"Loaded {len(self.frame_paths)} frames from {dir_path}")
+        self._set_status(f"Loaded {len(self.frame_paths)} frames from {dir_path}", progress=1, total=1)
+        self._reset_prefetch_state()
 
     def _read_optional_combo_path(self, combo: QComboBox) -> Optional[str]:
         text = combo.currentText().strip()
@@ -728,58 +1235,67 @@ class AnnotatorMainWindow(QMainWindow):
         if not self.frame_paths:
             return
         if self.auto_propagate_next and self.current_frame_idx < len(self.frame_paths) - 1:
+            next_idx = min(len(self.frame_paths) - 1, self.current_frame_idx + 1)
+            if self._has_valid_prefetch(next_idx):
+                self._set_current_frame_idx(next_idx)
+                self._schedule_prefetch_for_next_frame()
+                return
             if self._auto_propagate_next_frame():
-                self._set_current_frame_idx(min(len(self.frame_paths) - 1, self.current_frame_idx + 1))
+                self._set_current_frame_idx(next_idx)
+                self._schedule_prefetch_for_next_frame()
                 return
         self.go_next_frame()
 
     def _auto_propagate_next_frame(self) -> bool:
         enabled_obj_ids = self._get_enabled_propagation_obj_ids()
         if not enabled_obj_ids:
-            self.statusBar().showMessage("No objects enabled for auto propagation; moving to next frame.")
-            return False
-
-        missing_obj_ids = [
-            obj_id for obj_id in enabled_obj_ids
-            if self.box_prompts_by_frame_obj.get(self.current_frame_idx, {}).get(obj_id) is None
-        ]
-        if missing_obj_ids:
-            missing_names = [
-                self._find_object(obj_id).name if self._find_object(obj_id) else str(obj_id)
-                for obj_id in missing_obj_ids
-            ]
-            QMessageBox.warning(
-                self,
-                "Auto propagation skipped",
-                "These enabled objects have no box on the current frame: " + ", ".join(missing_names),
-            )
+            self._set_status("No objects enabled for auto propagation; moving to next frame.", progress=0, total=1)
             return False
 
         if not self._ensure_sam_initialized():
             return False
+        if self._has_valid_prefetch(min(len(self.frame_paths) - 1, self.current_frame_idx + 1)):
+            return True
 
-        unlocked_obj_ids = {
-            obj_id for obj_id in enabled_obj_ids
-            if not self._is_current_box_locked(self.current_frame_idx, obj_id)
-        }
-        if unlocked_obj_ids:
-            self._refine_current_frame_boxes(unlocked_obj_ids, show_no_prompts=False)
-
-        result = self._run_propagation_chunk(
+        prompt_payload = self._build_seed_prompts(
             seed_frame_idx=self.current_frame_idx,
-            n_frames=2,
             use_carryover_sampling=False,
             sample_points_per_object=self.sample_points_spin.value(),
             carryover_mode=self.carryover_mode_combo.currentText(),
             enabled_obj_ids=enabled_obj_ids,
         )
-        if result is None:
+        if prompt_payload is None:
             return False
 
-        self.statusBar().showMessage(
-            f"Auto propagated checked objects to frame {self.current_frame_idx + 2}."
-        )
-        return True
+        if not self._prefetch_busy:
+            task_id = self._enqueue_sam_task(
+                "prefetch",
+                {
+                    "seed_frame_idx": self.current_frame_idx,
+                    "n_frames": 2,
+                    "frame_paths": self.frame_paths,
+                    "prompt_payload": prompt_payload,
+                },
+            )
+            self._sam_task_contexts[task_id] = {
+                "kind": "prefetch",
+                "target_frame_idx": self.current_frame_idx + 1,
+                "seed_frame_idx": self.current_frame_idx,
+                "version": self._prefetch_prompt_version,
+            }
+            self._prefetch_busy = True
+            self._prefetch_seed_frame_idx = self.current_frame_idx
+            self._prefetch_target_frame_idx = self.current_frame_idx + 1
+            self._prefetch_active_version = self._prefetch_prompt_version
+            self._set_status("Prefetching next frame...", progress=0, total=1)
+        if self._prefetch_busy:
+            task_id = f"prefetch-wait:{self.current_frame_idx}->{self.current_frame_idx + 1}:{self._prefetch_prompt_version}"
+            self._sam_task_contexts[task_id] = {"kind": "prefetch_wait"}
+            self._sam_waiting[task_id] = QEventLoop()
+            self._sam_waiting[task_id].exec()
+            self._sam_waiting.pop(task_id, None)
+            self._sam_task_contexts.pop(task_id, None)
+        return self._has_valid_prefetch(min(len(self.frame_paths) - 1, self.current_frame_idx + 1))
 
     def _set_current_frame_idx(self, frame_idx: int) -> None:
         if not self.frame_paths:
@@ -897,6 +1413,7 @@ class AnnotatorMainWindow(QMainWindow):
         if self.segment_mode:
             self.segment_current_frame()
         else:
+            self._note_prompt_change_and_prefetch()
             self._render_current_frame()
 
     def on_image_drag(self, ui_x: float, ui_y: float) -> None:
@@ -938,6 +1455,7 @@ class AnnotatorMainWindow(QMainWindow):
         if not is_locked:
             self._refine_current_frame_boxes({self.active_object_id}, show_no_prompts=False)
             return
+        self._note_prompt_change_and_prefetch()
         self._render_current_frame()
 
     def _get_active_points(self) -> List[PointPrompt]:
@@ -945,9 +1463,12 @@ class AnnotatorMainWindow(QMainWindow):
         return frame_map.setdefault(self.active_object_id, [])
 
     def refresh_point_list(self) -> None:
+        current_row = self.point_list.currentRow()
+        self.point_list.blockSignals(True)
         self.point_list.clear()
         self._active_prompt_rows = []
         if self.active_object_id is None:
+            self.point_list.blockSignals(False)
             return
         frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
         box = frame_boxes.get(self.active_object_id)
@@ -961,6 +1482,9 @@ class AnnotatorMainWindow(QMainWindow):
             sign = "+" if p.is_positive else "-"
             self.point_list.addItem(f"{i}. {sign} ({p.x_px}, {p.y_px})")
             self._active_prompt_rows.append(("point", i - 1))
+        if self._active_prompt_rows and 0 <= current_row < len(self._active_prompt_rows):
+            self.point_list.setCurrentRow(current_row)
+        self.point_list.blockSignals(False)
 
     def remove_selected_prompt(self) -> None:
         if self.active_object_id is None:
@@ -986,6 +1510,7 @@ class AnnotatorMainWindow(QMainWindow):
             self._remove_object_output_from_frame(self.current_frame_idx, self.active_object_id)
             self.refresh_point_list()
             self._render_current_frame()
+            self._note_prompt_change_and_prefetch()
             return
         else:
             return
@@ -1007,25 +1532,45 @@ class AnnotatorMainWindow(QMainWindow):
         if removed_box:
             self._remove_object_output_from_frame(self.current_frame_idx, self.active_object_id)
             self._render_current_frame()
+            self._note_prompt_change_and_prefetch()
             return
         self._refresh_after_prompt_edit()
 
     def _ensure_sam_initialized(self) -> bool:
-        """Ensure the SAM3 model wrapper is available (no session started here)."""
-        if self.sam_adapter is not None:
+        """Ensure the SAM3 worker is available (no session started here)."""
+        if self._sam_ready:
             return True
-        return self._initialize_sam_adapter(show_errors=True)
+        return self._initialize_sam_worker(show_errors=True)
 
-    def _initialize_sam_adapter(self, show_errors: bool) -> bool:
-        try:
-            self.sam_adapter = Sam3Adapter(
-                checkpoint_path=self._checkpoint_path,
-                bpe_path=self._bpe_path,
-            )
-        except Exception as exc:
-            self.sam_adapter = None
-            if show_errors:
-                QMessageBox.critical(self, "SAM3 init failed", str(exc))
+    def _initialize_sam_worker(self, show_errors: bool) -> bool:
+        if self._sam_worker is not None and self._sam_ready:
+            return True
+        if self._sam_worker is not None and not self._sam_ready:
+            return False
+        worker = SamWorker(self._checkpoint_path, self._bpe_path)
+        thread = QThread()
+        worker.moveToThread(thread)
+        worker.initialized.connect(self._on_sam_worker_initialized)
+        worker.segment_done.connect(self._on_sam_segment_done)
+        worker.propagate_frame.connect(self._on_sam_propagate_frame)
+        worker.propagate_done.connect(self._on_sam_propagate_done)
+        worker.task_failed.connect(self._on_sam_task_failed)
+        worker.task_finished.connect(self._on_sam_task_finished)
+        self.task_requested.connect(worker.enqueue_task, Qt.QueuedConnection)
+        thread.started.connect(worker.initialize)
+        thread.start()
+
+        self._sam_worker = worker
+        self._sam_thread = thread
+
+        loop = QEventLoop()
+        self._sam_waiting["__init__"] = loop
+        loop.exec()
+        self._sam_waiting.pop("__init__", None)
+
+        if not self._sam_ready:
+            if show_errors and hasattr(self, "_sam_init_error") and self._sam_init_error:
+                QMessageBox.critical(self, "SAM3 init failed", self._sam_init_error)
             return False
         return True
 
@@ -1037,6 +1582,8 @@ class AnnotatorMainWindow(QMainWindow):
             for obj in self.objects
             if frame_prompts.get(obj.obj_id) or frame_boxes.get(obj.obj_id)
         }
+        if self._prefetch_busy:
+            self._cancel_prefetch(restart=True)
         self._refine_current_frame_boxes(obj_ids, show_no_prompts=True)
 
     def _refine_current_frame_boxes(
@@ -1050,79 +1597,30 @@ class AnnotatorMainWindow(QMainWindow):
             return False
         if not self._ensure_sam_initialized():
             return False
-
-        frame_prompts = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
-        frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
-
-        try:
-            img_pil = PilImage.open(str(self.frame_paths[self.current_frame_idx]))
-            self.sam_adapter.start_session([img_pil])
-        except Exception as exc:
-            QMessageBox.critical(self, "SAM3 session failed", str(exc))
+        payload = self._build_segment_payload(self.current_frame_idx, obj_ids, show_no_prompts)
+        if payload is None:
             return False
-
-        image = cv2.imread(str(self.frame_paths[self.current_frame_idx]))
-        if image is None:
-            QMessageBox.critical(self, "Segmentation failed", "Failed to load current frame.")
-            return False
-        h, w = image.shape[:2]
-        composite = self.outputs_by_frame.get(
-            self.current_frame_idx,
-            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+        task_id = self._enqueue_sam_task(
+            "segment",
+            {
+                "frame_idx": self.current_frame_idx,
+                "frame_path": self.frame_paths[self.current_frame_idx],
+                "payload": payload,
+            },
         )
-
-        refined_any = False
-        for obj_id in sorted(obj_ids):
-            points = frame_prompts.get(obj_id, [])
-            points_rel = [[p.x_px / w, p.y_px / h] for p in points]
-            labels = [1 if p.is_positive else 0 for p in points]
-            box = frame_boxes.get(obj_id)
-            if box is not None:
-                points_rel.append([box.x1_px / w, box.y1_px / h])
-                points_rel.append([box.x2_px / w, box.y2_px / h])
-                labels.append(2)
-                labels.append(3)
-            if not points_rel:
-                continue
-
-            try:
-                result = self.sam_adapter.add_object_points(
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    points_rel=points_rel,
-                    labels=labels,
-                )
-            except Exception as exc:
-                QMessageBox.critical(self, "Segmentation failed", str(exc))
-                return False
-
-            if obj_id not in result.obj_ids:
-                continue
-            ridx = result.obj_ids.index(obj_id)
-            obj_output = SamFrameOutput(
-                obj_ids=[obj_id],
-                masks=[result.masks[ridx]],
-                boxes_xywh_norm=[result.boxes_xywh_norm[ridx]],
-                scores=[result.scores[ridx]],
-            )
-            composite = self._merge_frame_outputs(composite, obj_output)
-            if not self._is_current_box_locked(self.current_frame_idx, obj_id):
-                self._sync_canonical_boxes_from_output(self.current_frame_idx, obj_output, preserve_locked=False)
-            refined_any = True
-
-        if refined_any:
-            self.outputs_by_frame[self.current_frame_idx] = composite
-            self.segment_mode = True
-            self.mode_label.setText("Mode: Segment" if self._use_point_prompt_mode() else "Mode: Box Annotation")
-        self._sync_current_box_lock_check()
-        self._render_current_frame()
-        return refined_any
+        result = self._wait_for_sam_task(task_id)
+        return bool(result)
 
     def propagate_next_frame(self) -> None:
         if not self._ensure_sam_initialized():
             return
         if not self.frame_paths:
             return
+        if self._propagation_busy:
+            self._set_status("Propagation already in progress.", progress=0, total=1)
+            return
+        if self._prefetch_busy:
+            self._cancel_prefetch(restart=False)
         enabled_obj_ids = self._get_enabled_propagation_obj_ids()
         if not enabled_obj_ids:
             QMessageBox.information(self, "No objects enabled", "Check at least one object to propagate.")
@@ -1147,6 +1645,13 @@ class AnnotatorMainWindow(QMainWindow):
                 sample_points_per_object=self.sample_points_spin.value(),
                 carryover_mode=self.carryover_mode_combo.currentText(),
             )
+            self._set_status(
+                f"Propagation starting: 0/{self._pending_propagation.total_chunks} chunks.",
+                progress=0,
+                total=self._pending_propagation.total_chunks,
+            )
+            self._propagation_enabled_obj_ids = enabled_obj_ids
+            self._propagation_view_frame_idx = self.current_frame_idx
         elif self.pause_between_chunks_check.isChecked():
             confirm = QMessageBox.question(
                 self,
@@ -1157,62 +1662,514 @@ class AnnotatorMainWindow(QMainWindow):
             )
             if confirm != QMessageBox.Yes:
                 self._clear_pending_propagation_state()
-                self.statusBar().showMessage("Propagation stopped for manual correction.")
+                self._set_status("Propagation stopped for manual correction.", progress=0, total=1)
                 return
+        state = self._pending_propagation
+        if state is None:
+            return
+        if state.next_seed_frame_idx >= len(self.frame_paths) - 1:
+            self._clear_pending_propagation_state()
+            QMessageBox.information(self, "End of video", "No more frames left to propagate.")
+            return
+
+        self._start_propagation_chunk_async(
+            enabled_obj_ids=self._propagation_enabled_obj_ids or enabled_obj_ids,
+            state=state,
+        )
+
+    def _build_seed_prompts(
+        self,
+        seed_frame_idx: int,
+        use_carryover_sampling: bool,
+        sample_points_per_object: int,
+        carryover_mode: str,
+        enabled_obj_ids: set[int],
+    ) -> Optional[Dict[int, Dict[str, object]]]:
+        frame_prompts = self.prompts_by_frame_obj.get(seed_frame_idx, {})
+        frame_boxes = self.box_prompts_by_frame_obj.get(seed_frame_idx, {})
+
+        frame_size = self._get_frame_size(seed_frame_idx)
+        if frame_size is None:
+            QMessageBox.critical(self, "Propagation setup failed", "Failed to load prompt source frame.")
+            return None
+        w, h = frame_size
+
+        prompts_to_apply: Dict[int, List[PointPrompt]] = {}
+        boxes_to_apply: Dict[int, BoxPrompt] = {}
+        masks_to_apply: Dict[int, np.ndarray] = {}
+        missing_obj_ids: List[int] = []
+        for obj_id, points in frame_prompts.items():
+            if points and obj_id in enabled_obj_ids:
+                prompts_to_apply[obj_id] = list(points)
+        for obj_id in enabled_obj_ids:
+            canonical_box = frame_boxes.get(obj_id)
+            if canonical_box is not None:
+                boxes_to_apply[obj_id] = canonical_box
+        seed_output = self.outputs_by_frame.get(seed_frame_idx)
+        if seed_output is not None:
+            for i, obj_id in enumerate(seed_output.obj_ids):
+                if obj_id in enabled_obj_ids and i < len(seed_output.masks):
+                    masks_to_apply[obj_id] = np.asarray(seed_output.masks[i]).astype(np.float32)
+
+        if not use_carryover_sampling:
+            sampled_boxes = self._sample_boxes_from_seed_masks(seed_frame_idx, h, w)
+            for obj_id in enabled_obj_ids:
+                if obj_id in prompts_to_apply or obj_id in boxes_to_apply:
+                    continue
+                if obj_id in sampled_boxes:
+                    boxes_to_apply[obj_id] = sampled_boxes[obj_id]
+                else:
+                    missing_obj_ids.append(obj_id)
+        elif use_carryover_sampling:
+            if carryover_mode == "Mask AABB Box":
+                sampled_boxes = self._sample_boxes_from_seed_masks(seed_frame_idx, h, w)
+                for obj_id, box in sampled_boxes.items():
+                    if (
+                        obj_id in enabled_obj_ids
+                        and obj_id not in prompts_to_apply
+                        and obj_id not in boxes_to_apply
+                    ):
+                        boxes_to_apply[obj_id] = box
+            else:
+                sampled = self._sample_prompts_from_seed_masks(seed_frame_idx, sample_points_per_object, h, w)
+                for obj_id, points in sampled.items():
+                    if (
+                        points
+                        and obj_id in enabled_obj_ids
+                        and obj_id not in prompts_to_apply
+                        and obj_id not in boxes_to_apply
+                    ):
+                        prompts_to_apply[obj_id] = points
+
+        if missing_obj_ids:
+            missing_names = [
+                self._find_object(obj_id).name if self._find_object(obj_id) else str(obj_id)
+                for obj_id in missing_obj_ids
+            ]
+            QMessageBox.warning(
+                self,
+                "Propagation setup failed",
+                "These enabled objects have no prompts or existing mask on the seed frame: "
+                + ", ".join(missing_names),
+            )
+            return None
+
+        obj_ids = set(prompts_to_apply.keys()) | set(boxes_to_apply.keys())
+        obj_ids |= set(masks_to_apply.keys())
+        if not obj_ids:
+            QMessageBox.information(
+                self,
+                "No prompts",
+                "No prompts available for this chunk seed. Add prompts on this frame or create a seed mask first.",
+            )
+            return None
+
+        payload: Dict[int, Dict[str, object]] = {}
+        for obj_id in obj_ids:
+            points = prompts_to_apply.get(obj_id, [])
+            points_rel = [[p.x_px / w, p.y_px / h] for p in points]
+            labels = [1 if p.is_positive else 0 for p in points]
+            box = boxes_to_apply.get(obj_id)
+            if box is not None:
+                points_rel.append([box.x1_px / w, box.y1_px / h])
+                points_rel.append([box.x2_px / w, box.y2_px / h])
+                labels.append(2)
+                labels.append(3)
+            if not points_rel:
+                continue
+            payload[obj_id] = {
+                "points_rel": points_rel,
+                "labels": labels,
+                "mask_input": masks_to_apply.get(obj_id),
+            }
+
+        if not payload:
+            QMessageBox.information(
+                self,
+                "No prompts",
+                "No valid prompts available for this chunk seed.",
+            )
+            return None
+
+        return payload
+
+    def _build_segment_payload(
+        self,
+        frame_idx: int,
+        obj_ids: set[int],
+        show_no_prompts: bool,
+    ) -> Optional[Dict[int, Dict[str, object]]]:
+        frame_size = self._get_frame_size(frame_idx)
+        if frame_size is None:
+            QMessageBox.critical(self, "Segmentation failed", "Failed to load current frame.")
+            return None
+        w, h = frame_size
+        frame_prompts = self.prompts_by_frame_obj.get(frame_idx, {})
+        frame_boxes = self.box_prompts_by_frame_obj.get(frame_idx, {})
+        payload: Dict[int, Dict[str, object]] = {}
+        for obj_id in sorted(obj_ids):
+            points = frame_prompts.get(obj_id, [])
+            points_rel = [[p.x_px / w, p.y_px / h] for p in points]
+            labels = [1 if p.is_positive else 0 for p in points]
+            box = frame_boxes.get(obj_id)
+            if box is not None:
+                points_rel.append([box.x1_px / w, box.y1_px / h])
+                points_rel.append([box.x2_px / w, box.y2_px / h])
+                labels.append(2)
+                labels.append(3)
+            if not points_rel:
+                continue
+            payload[obj_id] = {"points_rel": points_rel, "labels": labels}
+        if not payload and show_no_prompts:
+            QMessageBox.information(self, "No prompts", "Add point or box prompts for at least one object on this frame.")
+        return payload or None
+
+    def _start_propagation_chunk_async(
+        self,
+        *,
+        enabled_obj_ids: set[int],
+        state: PendingPropagationState,
+    ) -> None:
+        chunk_idx = state.completed_chunks + 1
+        seed_frame_idx = state.next_seed_frame_idx
+        use_carryover_sampling = chunk_idx > 1
+        prompt_payload = self._build_seed_prompts(
+            seed_frame_idx=seed_frame_idx,
+            use_carryover_sampling=use_carryover_sampling,
+            sample_points_per_object=state.sample_points_per_object,
+            carryover_mode=state.carryover_mode,
+            enabled_obj_ids=enabled_obj_ids,
+        )
+        if prompt_payload is None:
+            self._clear_pending_propagation_state()
+            return
+
+        self._propagation_busy = True
+        self._propagation_active_chunk_idx = chunk_idx
+        self._propagation_active_seed_frame_idx = seed_frame_idx
+        self._set_propagation_ui_enabled(False)
+        self._set_status(
+            f"Chunk {chunk_idx}/{state.total_chunks} running...",
+            progress=state.completed_chunks,
+            total=state.total_chunks,
+        )
+
+        task_id = self._enqueue_sam_task(
+            "propagate",
+            {
+                "seed_frame_idx": seed_frame_idx,
+                "n_frames": state.n_frames,
+                "frame_paths": self.frame_paths,
+                "prompt_payload": prompt_payload,
+            },
+        )
+        self._sam_task_contexts[task_id] = {
+            "kind": "manual",
+            "seed_frame_idx": seed_frame_idx,
+        }
+        self._propagation_task_id = task_id
+
+    def _handle_propagation_frame(self, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
+        existing_output = self.outputs_by_frame.get(
+            abs_frame_idx,
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+        )
+        merged_output = self._merge_frame_outputs(existing_output, output)
+        self.outputs_by_frame[abs_frame_idx] = merged_output
+        seed_frame_idx = getattr(self, "_propagation_active_seed_frame_idx", None)
+        if seed_frame_idx is not None and abs_frame_idx != seed_frame_idx:
+            self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
+            self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
+        if abs_frame_idx == self.current_frame_idx:
+            self._render_current_frame()
+        state = self._pending_propagation
+        if state is not None:
+            self._set_status(
+                f"Chunk {state.completed_chunks + 1}/{state.total_chunks}: {session_idx + 1}/{total_frames} frames",
+                progress=state.completed_chunks,
+                total=state.total_chunks,
+            )
+
+    def _on_sam_segment_done(self, task_id: str, frame_idx: int, composite: SamFrameOutput) -> None:
+        existing_output = self.outputs_by_frame.get(
+            frame_idx,
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+        )
+        merged = self._merge_frame_outputs(existing_output, composite)
+        if composite.obj_ids:
+            self.outputs_by_frame[frame_idx] = merged
+            if not self._is_current_box_locked(frame_idx, None):
+                self._sync_canonical_boxes_from_output(frame_idx, composite, preserve_locked=False)
+            self.segment_mode = True
+            self.mode_label.setText("Mode: Segment" if self._use_point_prompt_mode() else "Mode: Box Annotation")
+        self._sync_current_box_lock_check()
+        self._render_current_frame()
+        self._sam_task_results[task_id] = True
+        loop = self._sam_waiting.get(task_id)
+        if loop is not None:
+            loop.quit()
+        self._sam_task_contexts.pop(task_id, None)
+        self._schedule_prefetch_for_next_frame()
+
+    def _on_sam_propagate_frame(self, task_id: str, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
+        context = self._sam_task_contexts.get(task_id, {})
+        kind = context.get("kind")
+        if kind == "prefetch":
+            if self._prefetch_cancel_requested:
+                return
+            version = context.get("version")
+            target_frame_idx = context.get("target_frame_idx")
+            seed_frame_idx = context.get("seed_frame_idx")
+            if version != self._prefetch_prompt_version or abs_frame_idx != target_frame_idx:
+                return
+            existing_output = self.outputs_by_frame.get(
+                abs_frame_idx,
+                SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+            )
+            merged_output = self._merge_frame_outputs(existing_output, output)
+            self.outputs_by_frame[abs_frame_idx] = merged_output
+            self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
+            self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
+            self._prefetch_cached_frame_idx = abs_frame_idx
+            self._prefetch_cached_seed_idx = seed_frame_idx
+            self._prefetch_cached_version = version
+            wait_key = f"prefetch-wait:{seed_frame_idx}->{abs_frame_idx}:{version}"
+            loop = self._sam_waiting.get(wait_key)
+            if loop is not None:
+                loop.quit()
+            if abs_frame_idx == self.current_frame_idx:
+                self._render_current_frame()
+            return
+
+        existing_output = self.outputs_by_frame.get(
+            abs_frame_idx,
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+        )
+        merged_output = self._merge_frame_outputs(existing_output, output)
+        self.outputs_by_frame[abs_frame_idx] = merged_output
+        seed_frame_idx = context.get("seed_frame_idx")
+        if seed_frame_idx is not None and abs_frame_idx != seed_frame_idx:
+            self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
+            self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
+        if abs_frame_idx == self.current_frame_idx:
+            self._render_current_frame()
+        state = self._pending_propagation
+        if kind == "manual" and state is not None:
+            self._set_status(
+                f"Chunk {state.completed_chunks + 1}/{state.total_chunks}: {session_idx + 1}/{total_frames} frames",
+                progress=state.completed_chunks,
+                total=state.total_chunks,
+            )
+
+    def _on_sam_propagate_done(self, task_id: str, last_masked_frame_idx: int, chunk_last_frame_idx: int) -> None:
+        context = self._sam_task_contexts.get(task_id, {})
+        kind = context.get("kind")
+        if kind == "prefetch":
+            self._prefetch_busy = False
+            self._prefetch_cancel_requested = False
+            if self._prefetch_pending_restart:
+                self._prefetch_pending_restart = False
+                self._schedule_prefetch_for_next_frame()
+            self._sam_task_contexts.pop(task_id, None)
+            return
+        if kind == "auto":
+            self._sam_task_results[task_id] = (last_masked_frame_idx, chunk_last_frame_idx)
+            loop = self._sam_waiting.get(task_id)
+            if loop is not None:
+                loop.quit()
+            self._sam_task_contexts.pop(task_id, None)
+            return
 
         state = self._pending_propagation
         if state is None:
             return
+        chunk_seed_frame_idx = context.get("seed_frame_idx", state.next_seed_frame_idx)
+        state.remaining_chunks -= 1
+        state.completed_chunks += 1
+        state.next_seed_frame_idx = last_masked_frame_idx
+        self._set_status(
+            f"Chunk {state.completed_chunks}/{state.total_chunks} complete.",
+            progress=state.completed_chunks,
+            total=state.total_chunks,
+        )
 
         pause_between_chunks = self.pause_between_chunks_check.isChecked()
-        view_frame_idx = self.current_frame_idx
-        while state.remaining_chunks > 0:
-            if state.next_seed_frame_idx >= len(self.frame_paths) - 1:
-                self._clear_pending_propagation_state()
-                QMessageBox.information(self, "End of video", "No more frames left to propagate.")
-                return
-
-            chunk_idx = state.completed_chunks + 1
-            chunk_seed_frame_idx = state.next_seed_frame_idx
-            result = self._run_propagation_chunk(
-                seed_frame_idx=state.next_seed_frame_idx,
-                n_frames=state.n_frames,
-                use_carryover_sampling=chunk_idx > 1,
-                sample_points_per_object=state.sample_points_per_object,
-                carryover_mode=state.carryover_mode,
-                enabled_obj_ids=enabled_obj_ids,
-            )
-            if result is None:
-                self._clear_pending_propagation_state()
-                return
-
-            last_masked_frame_idx, chunk_last_frame_idx = result
-            state.remaining_chunks -= 1
-            state.completed_chunks += 1
-            state.next_seed_frame_idx = last_masked_frame_idx
-
+        if pause_between_chunks and state.remaining_chunks > 0:
             chunk_span = f"{chunk_seed_frame_idx + 1}-{chunk_last_frame_idx + 1}"
-            if pause_between_chunks and state.remaining_chunks > 0:
-                self._set_current_frame_idx(view_frame_idx)
-                self.propagate_btn.setText("Continue Propagate")
-                self.statusBar().showMessage(
-                    f"Chunk {chunk_idx}/{state.total_chunks} complete over frames {chunk_span}. Review and click Continue Propagate."
-                )
-                return
+            if self._propagation_view_frame_idx is not None:
+                self._set_current_frame_idx(self._propagation_view_frame_idx)
+            self.propagate_btn.setText("Continue Propagate")
+            self._set_status(
+                f"Chunk {state.completed_chunks}/{state.total_chunks} complete over frames {chunk_span}. Review and click Continue Propagate.",
+                progress=state.completed_chunks,
+                total=state.total_chunks,
+            )
+            self._propagation_continue_after_chunk = False
+            self._propagation_busy = False
+            self._set_propagation_ui_enabled(True)
+            return
 
-            if pause_between_chunks and state.remaining_chunks == 0:
-                self._set_current_frame_idx(view_frame_idx)
-                self._clear_pending_propagation_state()
-                self.statusBar().showMessage(
-                    f"Propagation complete: {state.total_chunks}/{state.total_chunks} chunks."
-                )
-                return
+        if state.remaining_chunks == 0:
+            if self._propagation_view_frame_idx is not None:
+                self._set_current_frame_idx(self._propagation_view_frame_idx)
+            self._set_status(
+                f"Propagation complete: {state.total_chunks}/{state.total_chunks} chunks.",
+                progress=state.total_chunks,
+                total=state.total_chunks,
+            )
+            self._propagation_busy = False
+            self._set_propagation_ui_enabled(True)
+            self._clear_pending_propagation_state()
+            self._sam_task_contexts.pop(task_id, None)
+            return
 
-        self._set_current_frame_idx(view_frame_idx)
-        self._clear_pending_propagation_state()
-        self.statusBar().showMessage(
-            f"Propagation complete: {state.total_chunks}/{state.total_chunks} chunks."
+        self._propagation_busy = False
+        self._set_propagation_ui_enabled(True)
+        self._start_propagation_chunk_async(
+            enabled_obj_ids=self._propagation_enabled_obj_ids or set(),
+            state=state,
         )
+        self._sam_task_contexts.pop(task_id, None)
+
+    def _on_sam_task_failed(self, task_id: str, message: str, is_warning: bool) -> None:
+        context = self._sam_task_contexts.get(task_id, {})
+        kind = context.get("kind")
+        if kind == "prefetch":
+            self._prefetch_busy = False
+            self._prefetch_cancel_requested = False
+            self._prefetch_cached_frame_idx = None
+            self._prefetch_cached_seed_idx = None
+            self._prefetch_cached_version = None
+            self._sam_task_contexts.pop(task_id, None)
+            return
+        if is_warning:
+            QMessageBox.warning(self, "Propagation stopped", message)
+        else:
+            QMessageBox.critical(self, "Propagation failed", message)
+        self._sam_task_results[task_id] = None
+        loop = self._sam_waiting.get(task_id)
+        if loop is not None:
+            loop.quit()
+        self._sam_task_contexts.pop(task_id, None)
+
+    def _on_sam_task_finished(self, task_id: str) -> None:
+        self._sam_task_results[task_id] = True
+        loop = self._sam_waiting.get(task_id)
+        if loop is not None:
+            loop.quit()
+        self._sam_task_contexts.pop(task_id, None)
+
+    def _handle_prefetch_frame(self, abs_frame_idx: int, output: SamFrameOutput, _session_idx: int, _total_frames: int) -> None:
+        if self._prefetch_cancel_requested:
+            return
+        if self._prefetch_active_version is None or self._prefetch_active_version != self._prefetch_prompt_version:
+            return
+        target_frame_idx = self._prefetch_target_frame_idx
+        if target_frame_idx is None or abs_frame_idx != target_frame_idx:
+            return
+        existing_output = self.outputs_by_frame.get(
+            abs_frame_idx,
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+        )
+        merged_output = self._merge_frame_outputs(existing_output, output)
+        self.outputs_by_frame[abs_frame_idx] = merged_output
+        self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
+        self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
+        self._prefetch_cached_frame_idx = abs_frame_idx
+        self._prefetch_cached_seed_idx = self._prefetch_seed_frame_idx
+        self._prefetch_cached_version = self._prefetch_active_version
+        if abs_frame_idx == self.current_frame_idx:
+            self._render_current_frame()
+
+    def _handle_prefetch_chunk_done(self, _chunk_idx: int, _last_masked_frame_idx: int, _chunk_last_frame_idx: int) -> None:
+        pass
+
+    def _handle_prefetch_failed(self, message: str, is_warning: bool) -> None:
+        if is_warning:
+            self._set_status(f"Prefetch stopped: {message}", progress=0, total=1)
+        else:
+            self._set_status(f"Prefetch failed: {message}", progress=0, total=1)
+        self._prefetch_cached_frame_idx = None
+        self._prefetch_cached_seed_idx = None
+        self._prefetch_cached_version = None
+
+    def _handle_prefetch_finished(self) -> None:
+        self._cleanup_prefetch_worker()
+        self._prefetch_busy = False
+        self._prefetch_cancel_requested = False
+        if self._prefetch_pending_restart:
+            self._prefetch_pending_restart = False
+            self._schedule_prefetch_for_next_frame()
+
+    def _cleanup_prefetch_worker(self) -> None:
+        self._prefetch_worker = None
+        self._prefetch_thread = None
+
+    def _handle_propagation_chunk_done(self, chunk_idx: int, last_masked_frame_idx: int, chunk_last_frame_idx: int) -> None:
+        state = self._pending_propagation
+        if state is None:
+            return
+        chunk_seed_frame_idx = getattr(self, "_propagation_active_seed_frame_idx", state.next_seed_frame_idx)
+        state.remaining_chunks -= 1
+        state.completed_chunks += 1
+        state.next_seed_frame_idx = last_masked_frame_idx
+        self._set_status(
+            f"Chunk {chunk_idx}/{state.total_chunks} complete.",
+            progress=state.completed_chunks,
+            total=state.total_chunks,
+        )
+
+        pause_between_chunks = self.pause_between_chunks_check.isChecked()
+        if pause_between_chunks and state.remaining_chunks > 0:
+            chunk_span = f"{chunk_seed_frame_idx + 1}-{chunk_last_frame_idx + 1}"
+            if self._propagation_view_frame_idx is not None:
+                self._set_current_frame_idx(self._propagation_view_frame_idx)
+            self.propagate_btn.setText("Continue Propagate")
+            self._set_status(
+                f"Chunk {chunk_idx}/{state.total_chunks} complete over frames {chunk_span}. Review and click Continue Propagate.",
+                progress=state.completed_chunks,
+                total=state.total_chunks,
+            )
+            self._propagation_continue_after_chunk = False
+            return
+
+        if state.remaining_chunks == 0:
+            if self._propagation_view_frame_idx is not None:
+                self._set_current_frame_idx(self._propagation_view_frame_idx)
+            self._set_status(
+                f"Propagation complete: {state.total_chunks}/{state.total_chunks} chunks.",
+                progress=state.total_chunks,
+                total=state.total_chunks,
+            )
+            self._propagation_continue_after_chunk = False
+            return
+
+        self._propagation_continue_after_chunk = True
+
+    def _handle_propagation_failed(self, message: str, is_warning: bool) -> None:
+        if is_warning:
+            QMessageBox.warning(self, "Propagation stopped", message)
+        else:
+            QMessageBox.critical(self, "Propagation failed", message)
+        self._clear_pending_propagation_state()
+        self._propagation_continue_after_chunk = False
+
+    def _handle_propagation_finished(self) -> None:
+        self._cleanup_propagation_worker()
+        if self._propagation_continue_after_chunk and self._pending_propagation is not None:
+            self._start_propagation_chunk_async(
+                enabled_obj_ids=self._propagation_enabled_obj_ids or set(),
+                state=self._pending_propagation,
+            )
+            return
+        self._propagation_busy = False
+        self._set_propagation_ui_enabled(True)
+        if self._pending_propagation is None or self._pending_propagation.remaining_chunks == 0:
+            self._clear_pending_propagation_state()
+
+    def _cleanup_propagation_worker(self) -> None:
+        self._propagation_worker = None
+        self._propagation_thread = None
 
     def _run_propagation_chunk(
         self,
@@ -1223,62 +2180,32 @@ class AnnotatorMainWindow(QMainWindow):
         carryover_mode: str,
         enabled_obj_ids: set[int],
     ) -> Optional[Tuple[int, int]]:
-        abs_start = seed_frame_idx
-        abs_end = min(abs_start + n_frames, len(self.frame_paths))
-        actual_n = abs_end - abs_start
-        if actual_n <= 1:
-            QMessageBox.information(self, "End of video", "No forward frames available from current seed frame.")
-            return None
-
-        try:
-            imgs_pil = [PilImage.open(str(self.frame_paths[i])) for i in range(abs_start, abs_end)]
-            self.sam_adapter.start_session(imgs_pil)
-        except Exception as exc:
-            QMessageBox.critical(self, "SAM3 session failed", str(exc))
-            return None
-
-        if not self._apply_prompts_for_seed(
-            seed_frame_idx=abs_start,
+        if self._prefetch_busy:
+            self._cancel_prefetch(restart=False)
+        prompt_payload = self._build_seed_prompts(
+            seed_frame_idx=seed_frame_idx,
             use_carryover_sampling=use_carryover_sampling,
             sample_points_per_object=sample_points_per_object,
             carryover_mode=carryover_mode,
             enabled_obj_ids=enabled_obj_ids,
-        ):
+        )
+        if prompt_payload is None:
             return None
-
-        try:
-            session_outputs = self.sam_adapter.propagate_n_frames(
-                start_frame_idx=0,
-                max_frames=actual_n,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Propagation failed", str(exc))
-            return None
-
-        last_masked_frame_idx: Optional[int] = None
-        for session_idx, output in session_outputs.items():
-            abs_frame_idx = abs_start + session_idx
-            existing_output = self.outputs_by_frame.get(
-                abs_frame_idx,
-                SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
-            )
-            merged_output = self._merge_frame_outputs(existing_output, output)
-            self.outputs_by_frame[abs_frame_idx] = merged_output
-            if abs_frame_idx != seed_frame_idx:
-                self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
-                self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
-            if self._frame_output_has_masks(output):
-                last_masked_frame_idx = abs_frame_idx
-
-        if last_masked_frame_idx is None:
-            QMessageBox.warning(
-                self,
-                "Propagation stopped",
-                "Chunk produced no valid masks. Please refine prompts and run again.",
-            )
-            return None
-
-        return last_masked_frame_idx, abs_end - 1
+        task_id = self._enqueue_sam_task(
+            "propagate",
+            {
+                "seed_frame_idx": seed_frame_idx,
+                "n_frames": n_frames,
+                "frame_paths": self.frame_paths,
+                "prompt_payload": prompt_payload,
+            },
+        )
+        self._sam_task_contexts[task_id] = {
+            "kind": "auto",
+            "seed_frame_idx": seed_frame_idx,
+        }
+        result = self._wait_for_sam_task(task_id)
+        return result
 
     def _frame_output_has_masks(self, output: SamFrameOutput) -> bool:
         for mask in output.masks:
@@ -1295,6 +2222,7 @@ class AnnotatorMainWindow(QMainWindow):
                 self._render_current_frame()
         else:
             self._render_current_frame()
+        self._note_prompt_change_and_prefetch()
 
     def _active_object_has_any_prompts(self) -> bool:
         if self.active_object_id is None:
@@ -1382,11 +2310,11 @@ class AnnotatorMainWindow(QMainWindow):
         frame_prompts = self.prompts_by_frame_obj.get(seed_frame_idx, {})
         frame_boxes = self.box_prompts_by_frame_obj.get(seed_frame_idx, {})
 
-        image = cv2.imread(str(self.frame_paths[seed_frame_idx]))
-        if image is None:
+        frame_size = self._get_frame_size(seed_frame_idx)
+        if frame_size is None:
             QMessageBox.critical(self, "Propagation setup failed", "Failed to load prompt source frame.")
             return False
-        h, w = image.shape[:2]
+        w, h = frame_size
 
         # Manual prompts are used only for the objects that have them on this seed frame.
         # For carryover chunks, objects without manual prompts fall back to mask-derived carryover prompts.
@@ -1570,10 +2498,51 @@ class AnnotatorMainWindow(QMainWindow):
             points = src_prompts.get(obj_id)
             if not points:
                 continue
-            dst_prompts[obj_id] = [
+            if self.translate_prompts_on_propagation:
+                dst_prompts[obj_id] = self._translate_prompts_by_box_delta(
+                    src_frame_idx=src_frame_idx,
+                    dst_frame_idx=dst_frame_idx,
+                    obj_id=obj_id,
+                    points=points,
+                )
+            else:
+                dst_prompts[obj_id] = [
+                    PointPrompt(x_px=p.x_px, y_px=p.y_px, is_positive=p.is_positive)
+                    for p in points
+                ]
+
+    def _translate_prompts_by_box_delta(
+        self,
+        src_frame_idx: int,
+        dst_frame_idx: int,
+        obj_id: int,
+        points: List[PointPrompt],
+    ) -> List[PointPrompt]:
+        src_box = self.box_prompts_by_frame_obj.get(src_frame_idx, {}).get(obj_id)
+        dst_box = self.box_prompts_by_frame_obj.get(dst_frame_idx, {}).get(obj_id)
+        frame_size = self._get_frame_size(dst_frame_idx)
+        if src_box is None or dst_box is None or frame_size is None:
+            return [
                 PointPrompt(x_px=p.x_px, y_px=p.y_px, is_positive=p.is_positive)
                 for p in points
             ]
+
+        width, height = frame_size
+        src_cx = (src_box.x1_px + src_box.x2_px) / 2.0
+        src_cy = (src_box.y1_px + src_box.y2_px) / 2.0
+        dst_cx = (dst_box.x1_px + dst_box.x2_px) / 2.0
+        dst_cy = (dst_box.y1_px + dst_box.y2_px) / 2.0
+        delta_x = dst_cx - src_cx
+        delta_y = dst_cy - src_cy
+
+        translated: List[PointPrompt] = []
+        for p in points:
+            x_px = int(round(p.x_px + delta_x))
+            y_px = int(round(p.y_px + delta_y))
+            x_px = max(0, min(width - 1, x_px))
+            y_px = max(0, min(height - 1, y_px))
+            translated.append(PointPrompt(x_px=x_px, y_px=y_px, is_positive=p.is_positive))
+        return translated
 
     def _sync_canonical_boxes_from_output(
         self,
@@ -1621,6 +2590,13 @@ class AnnotatorMainWindow(QMainWindow):
     def _clear_pending_propagation_state(self) -> None:
         self._pending_propagation = None
         self.propagate_btn.setText("Propagate")
+        self._propagation_enabled_obj_ids = None
+        self._propagation_view_frame_idx = None
+        self._propagation_continue_after_chunk = False
+        self._propagation_active_chunk_idx = None
+        self._propagation_active_seed_frame_idx = None
+        self._propagation_task_id = None
+        self._schedule_prefetch_for_next_frame()
 
     def export_annotations(self) -> None:
         if not self.frame_paths:
@@ -1668,7 +2644,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._sync_selected_box_state()
 
         frame_path = self.frame_paths[self.current_frame_idx]
-        img = cv2.imread(str(frame_path))
+        img = self._read_frame_bgr(self.current_frame_idx)
         if img is None:
             self.image_label.setText(f"Failed to read: {frame_path.name}")
             return
@@ -1760,11 +2736,14 @@ class AnnotatorMainWindow(QMainWindow):
 
         if self.show_prompts:
             frame_map = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
+            selected_prompt_idx = self._get_selected_point_prompt_idx()
             for obj_id, plist in frame_map.items():
                 obj = self._find_object(obj_id)
                 color = obj.color_bgr if obj else (255, 255, 255)
-                for p in plist:
+                for idx, p in enumerate(plist):
                     radius = 6
+                    if obj_id == self.active_object_id and idx == selected_prompt_idx:
+                        cv2.circle(img, (p.x_px, p.y_px), radius + 3, (255, 255, 255), 2)
                     if p.is_positive:
                         cv2.circle(img, (p.x_px, p.y_px), radius, color, -1)
                     else:
@@ -1773,6 +2752,15 @@ class AnnotatorMainWindow(QMainWindow):
                         cv2.line(img, (p.x_px - radius, p.y_px + radius), (p.x_px + radius, p.y_px - radius), color, 2)
 
         return img
+
+    def _get_selected_point_prompt_idx(self) -> Optional[int]:
+        row = self.point_list.currentRow()
+        if row < 0 or row >= len(self._active_prompt_rows):
+            return None
+        prompt_type, idx = self._active_prompt_rows[row]
+        if prompt_type != "point":
+            return None
+        return idx
 
     def _is_box_mode(self) -> bool:
         return not self._use_point_prompt_mode()
@@ -2054,10 +3042,10 @@ class AnnotatorMainWindow(QMainWindow):
     def _map_ui_to_image_xy(self, ui_x: float, ui_y: float) -> Optional[Tuple[int, int]]:
         if not self.frame_paths:
             return None
-        frame = cv2.imread(str(self.frame_paths[self.current_frame_idx]))
-        if frame is None:
+        frame_size = self._get_current_frame_size()
+        if frame_size is None:
             return None
-        h, w = frame.shape[:2]
+        w, h = frame_size
 
         x_off, y_off = self._display_offset
         rel_x = ui_x - x_off
@@ -2080,10 +3068,10 @@ class AnnotatorMainWindow(QMainWindow):
     def _map_ui_to_image_xy_clamped(self, ui_x: float, ui_y: float) -> Optional[Tuple[int, int]]:
         if not self.frame_paths or self._display_scale <= 0:
             return None
-        frame = cv2.imread(str(self.frame_paths[self.current_frame_idx]))
-        if frame is None:
+        frame_size = self._get_current_frame_size()
+        if frame_size is None:
             return None
-        h, w = frame.shape[:2]
+        w, h = frame_size
 
         x_off, y_off = self._display_offset
         rel_x = ui_x - x_off
@@ -2098,10 +3086,10 @@ class AnnotatorMainWindow(QMainWindow):
     def _map_image_to_ui_xy(self, x_img: int, y_img: int) -> Optional[Tuple[int, int]]:
         if self._display_scale <= 0 or not self.frame_paths:
             return None
-        frame = cv2.imread(str(self.frame_paths[self.current_frame_idx]))
-        if frame is None:
+        frame_size = self._get_current_frame_size()
+        if frame_size is None:
             return None
-        h, w = frame.shape[:2]
+        w, h = frame_size
         x_img = max(0, min(w - 1, x_img))
         y_img = max(0, min(h - 1, y_img))
 
@@ -2200,10 +3188,28 @@ class AnnotatorMainWindow(QMainWindow):
         if not self.frame_paths or frame_idx < 0 or frame_idx >= len(self.frame_paths):
             return None
         frame = cv2.imread(str(self.frame_paths[frame_idx]))
-        if frame is None:
+        if frame is not None:
+            h, w = frame.shape[:2]
+            return w, h
+        try:
+            with PilImage.open(str(self.frame_paths[frame_idx])) as img:
+                w, h = img.size
+            return w, h
+        except Exception:
             return None
-        h, w = frame.shape[:2]
-        return w, h
+
+    def _read_frame_bgr(self, frame_idx: int) -> Optional[np.ndarray]:
+        if not self.frame_paths or frame_idx < 0 or frame_idx >= len(self.frame_paths):
+            return None
+        frame = cv2.imread(str(self.frame_paths[frame_idx]))
+        if frame is not None:
+            return frame
+        try:
+            with PilImage.open(str(self.frame_paths[frame_idx])) as img:
+                rgb = img.convert("RGB")
+            return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+        except Exception:
+            return None
 
     def _color_for_obj(self, obj_id: int) -> Tuple[int, int, int]:
         palette = [
@@ -2220,8 +3226,9 @@ class AnnotatorMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            if self.sam_adapter:
-                self.sam_adapter.close_session()
+            if self._sam_thread is not None:
+                self._sam_thread.quit()
+                self._sam_thread.wait()
         except Exception:
             pass
         super().closeEvent(event)

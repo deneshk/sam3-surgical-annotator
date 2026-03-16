@@ -28,6 +28,7 @@ Implemented:
 - Prompt editing:
   - Remove selected prompt
   - Clear active object prompts
+  - Selecting a point row in the annotation list highlights that point on the image with a white outline.
   - Segment mode auto-refreshes on prompt edits
   - If the last prompt/box for an object is removed on the current frame, that object's stored segmentation/derived box is removed from that frame.
   - Prompt boxes cannot be edited while `Show Prompts` is off.
@@ -60,11 +61,19 @@ Implemented:
   - Only checked objects are included in propagation.
   - Newly propagated object outputs are merged per-frame with existing outputs instead of clearing other objects on overlapping frames.
   - Viewer stays on the current frame during propagation; propagation no longer jumps to the last masked frame.
+  - Carried point prompts are translated forward by the propagated box motion (box-center delta) when both source and destination boxes are available; otherwise they are copied unchanged.
+- Control panel:
+  - Tabbed layout: `Prompting` and `Segment/Propagate`.
+  - Status bar includes a progress bar with status text (directory load + propagation) and a live cursor coordinate readout over the image.
+- Layout:
+  - Image canvas centered in a landscape-format main area.
+  - Left column reserved as a placeholder (currently blank).
 - Overlay rendering:
   - Masks + model boxes + prompt visuals.
   - Independent toggles for `Show Prompts`, `Show Segmentations`, and `Show Boxes`.
   - Adjustable mask opacity and predicted-box line thickness.
   - Prompt boxes render as dashed outlines; predicted boxes render as solid outlines.
+  - The currently selected point prompt is outlined in white for easier visual identification.
   - Box drag preview uses `QRubberBand` (no drag-time rerender zoom).
 - Navigation / viewing:
   - Frame slider for scrubbing
@@ -77,19 +86,21 @@ Implemented:
   - COCO-style JSON + mask PNG files.
 
 ## Memory / GPU Loading Behaviour (important)
-SAM3 is lazily loaded; model weights are not put on GPU at directory load time.
+SAM3 is constructed on the first successful directory load, not at app startup. After that, later directory loads reuse the same adapter/model instance and only close any active session. All SAM3 calls run on a dedicated `SamWorker` in a single QThread; the UI sends queued tasks and waits for completion only when it must block.
 
 | Action | What happens on GPU |
 |---|---|
-| Load frame directory | Nothing; only frame file paths stored, checkpoint/BPE paths captured for later |
-| Click **Segment** | If needed, loads weights and constructs `Sam3Adapter`. Creates a fresh 1-frame PIL session for current frame, injects prompts at session frame 0, returns mask output |
-| Click **Propagate** | If needed, loads weights first. For each chunk, creates a fresh N-frame PIL session from seed frame, injects per-object prompts at session frame 0 (manual prompts first; on chunk 1, stored seed masks may be converted to AABB box prompts), runs forward propagation, remaps session indices to absolute frame indices |
-| Change directory | Resets `sam_adapter` to `None`; weights reload on next Segment/Propagate |
+| First successful **Load frame directory** | Captures checkpoint/BPE paths if provided, constructs `Sam3Adapter`, and loads the SAM3 model onto GPU |
+| Later **Load frame directory** actions | Closes any active session, reuses the existing adapter/model, and resets app state for the new frame directory |
+| Click **Segment** | Creates a fresh 1-frame PIL session for current frame, injects prompts at session frame 0, returns mask output |
+| Click **Propagate** | For each chunk, creates a fresh N-frame PIL session from seed frame, injects per-object prompts at session frame 0 (manual prompts first; on chunk 1, stored seed masks may be converted to AABB box prompts), runs forward propagation, remaps session indices to absolute frame indices |
+| Change directory | Keeps the existing adapter/model alive and closes the current session before resetting annotator state |
 
 Notes:
 - No explicit memory cap is set; PyTorch default CUDA allocator is used.
 - Negative points use SAM convention `1` foreground / `0` background.
 - Box prompts are routed through point prompt API with labels `(2,3)`.
+- A single adapter instance is shared by all segment/propagate/prefetch tasks; no parallel SAM3 model instances are created.
 
 ## How To Run
 From `sam3v2/`:
@@ -109,6 +120,7 @@ python3 -m py_compile surgical_annotator_qt.py tools/exporters/coco_export.py
 ## Environment Notes
 - SAM3 runtime deps (Torch/CUDA, model access) must be available in active env.
 - If checkpoint/BPE not provided in UI, SAM3 defaults are used (may require HF access).
+- Checkpoint/BPE changes only affect the first adapter construction in the current app session; after SAM3 is loaded once, later directory loads reuse the existing model instance.
 - Pillow is required (used for single/N-frame PIL sessions).
 
 ## Key Files To Read First
@@ -124,6 +136,10 @@ python3 -m py_compile surgical_annotator_qt.py tools/exporters/coco_export.py
 | Symbol | Purpose |
 |---|---|
 | `Sam3Adapter` | Thin wrapper around `Sam3VideoPredictor`; owns session lifecycle |
+| `SamWorker` | Owns the single `Sam3Adapter` instance and runs SAM3 tasks in a QThread |
+| `AnnotatorMainWindow._initialize_sam_worker()` | Creates the SAM worker thread and waits for adapter init |
+| `AnnotatorMainWindow._enqueue_sam_task()` | Sends queued SAM tasks to the worker |
+| `AnnotatorMainWindow._wait_for_sam_task()` | UI-thread wait for specific task completion |
 | `Sam3Adapter.start_session(resource_path)` | Accepts path string or list of `PIL.Image` |
 | `Sam3Adapter.propagate_n_frames(start, max_frames)` | Forward propagation stream; returns session-relative frame outputs |
 | `AnnotatorMainWindow.segment_current_frame()` | Single-frame segmentation path |
@@ -134,9 +150,10 @@ python3 -m py_compile surgical_annotator_qt.py tools/exporters/coco_export.py
 | `AnnotatorMainWindow.fit_current_frame_to_view()` | Resets zoom/pan viewport state |
 | `AnnotatorMainWindow._sample_prompts_from_seed_masks()` | Carryover point sampling |
 | `AnnotatorMainWindow._sample_boxes_from_seed_masks()` | Carryover mask->AABB box sampling |
+| `AnnotatorMainWindow._schedule_prefetch_for_next_frame()` | One-frame lookahead propagation prefetch |
+| `AnnotatorMainWindow._auto_propagate_next_frame()` | Right-arrow path that waits for prefetch if needed |
 
 ## Known Gaps / Next Improvements
-- Move SAM calls off UI thread (worker/QThread) to avoid UI freezes.
 - Add test coverage (unit + integration with mocked SAM adapter).
 - Improve exporter robustness:
   - ensure mask resize to frame size before writing/area
@@ -181,3 +198,9 @@ Before edits, summarize current behavior and your exact implementation plan.
 | 2026-03-12 | Differentiated prompt vs predicted boxes with dashed vs solid rendering |
 | 2026-03-12 | Added zoom, right-click pan, fit-to-screen reset, frame slider, frame jump, and hotkeys |
 | 2026-03-12 | Propagation now preserves current view frame, merges per-object outputs, and allows chunk-1 fallback from stored seed masks to AABB box prompts |
+| 2026-03-15 | Deferred SAM3 construction until first successful directory load and reused the same adapter/model across later directory changes |
+| 2026-03-15 | Added white overlay highlight for the currently selected point prompt in the annotation list |
+| 2026-03-15 | Changed prompt carryover during propagation to translate point prompts by propagated box motion instead of keeping them static |
+| 2026-03-16 | Moved all SAM3 calls to a single `SamWorker` (QThread) and reused one adapter for segment/propagate/prefetch |
+| 2026-03-16 | Added 1-frame prefetch caching for right-arrow navigation and prompt-change-triggered prefetch |
+| 2026-03-16 | Tabbed control panel, centered landscape image layout, status bar progress text + cursor coordinates |
