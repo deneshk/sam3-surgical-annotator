@@ -20,7 +20,7 @@
 - Use right-click drag to pan the zoomed image view.
 - Use `Fit to Screen` to reset zoom and pan to the default fitted view.
 - Use the frame slider to scrub through the loaded frames.
-- Use the `Go to` box to jump directly to a frame number.
+- Use the frame jump control (left/right arrows + field) to jump directly to a frame number.
 - Hotkeys: Left/Right arrows move frame-by-frame, `P` starts propagation.
 - `Auto Propagate Next Frame` can propagate checked objects one frame ahead when the right arrow is used.
 - Internally, each box prompt is passed to SAM3 as two point prompts with labels `(2, 3)`.
@@ -39,6 +39,7 @@
     - `Mask AABB Box` (converts last mask to axis-aligned box carryover)
   - optional `Pause Between Chunks` review mode
 - Exports COCO-style JSON and mask PNG files.
+- Save/Load session files (JSON + mask PNGs) with optional auto-save.
 
 ## Install
 From `sam3v2/`:
@@ -69,20 +70,22 @@ python3 surgical_annotator_qt.py
 4. Optionally enable `Auto Propagate Next Frame`.
    - With the toggle on, pressing the right arrow attempts a one-frame propagation for checked objects before moving to the next frame.
 5. Use the `View` controls to toggle segmentations/boxes and tune mask opacity or box thickness.
-6. Set `N frames`, `Chunks`, `Sample pts`, `Carryover` mode, and optional `Pause Between Chunks` when using manual propagation.
+6. Set `Checkpoint` (optional), `N frames`, `Chunks`, `Sample pts`, `Carryover` mode, and optional `Pause Between Chunks` when using manual propagation.
 7. Click `Propagate`.
     - Only checked objects are included in propagation.
    - The canonical box on the seed frame is used as the primary propagation input.
 8. If pause is enabled and chunks remain, review/correct and click `Continue Propagate`.
-9. Use `Show Advanced Prompt Controls` only when you want the older point-prompt workflow.
+9. Use `Save Session` to persist your work (and enable auto-save if desired).
 10. `Export COCO` from menu when done.
 
 ## Notes
-- If checkpoint/BPE fields are left at default, SAM3 will use its default loading path.
-- If needed, type custom checkpoint/BPE paths in the editable combo fields.
+- If the checkpoint field is left at default, SAM3 will use its default loading path.
+- If needed, type a custom checkpoint path in the editable combo field.
 - Bounding boxes are derived from SAM3 masks.
 - Locked boxes are preserved on their own frame but still used as seeds for future propagation.
 - When propagation advances to a later frame, the propagated box is stored there and the prior frame's point prompts are carried forward for the same object.
+- Point translation during propagation maps relative position within the source box to the destination box (scale + translate); out-of-box points are not clamped.
+- Point translation is applied only during propagation, not when re-segmenting the same frame.
 - Manual prompts are only used for the chunk whose seed frame contains those prompts.
 - For carryover chunks, if the seed frame has no manual prompts, prompts are sampled from the seed frame's last known masks.
 - In `Mask AABB Box` carryover mode, last masks are converted to axis-aligned boxes and passed as point labels `(2,3)`.

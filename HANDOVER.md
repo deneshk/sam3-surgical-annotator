@@ -61,9 +61,12 @@ Implemented:
   - Only checked objects are included in propagation.
   - Newly propagated object outputs are merged per-frame with existing outputs instead of clearing other objects on overlapping frames.
   - Viewer stays on the current frame during propagation; propagation no longer jumps to the last masked frame.
-  - Carried point prompts are translated forward by the propagated box motion (box-center delta) when both source and destination boxes are available; otherwise they are copied unchanged.
+  - Carried point prompts are translated forward by mapping their relative position within the source box to the destination box (scale + translate); no clamping is applied for out-of-box points.
+  - Point translation is applied only on propagation, not during same-frame re-segmentation.
 - Control panel:
   - Tabbed layout: `Prompting` and `Segment/Propagate`.
+  - Checkpoint selector moved to `Segment/Propagate`; BPE dropdown removed.
+  - Auto-save toggle + interval (minutes) for session save.
   - Status bar includes a progress bar with status text (directory load + propagation) and a live cursor coordinate readout over the image.
 - Layout:
   - Image canvas centered in a landscape-format main area.
@@ -73,17 +76,19 @@ Implemented:
   - Independent toggles for `Show Prompts`, `Show Segmentations`, and `Show Boxes`.
   - Adjustable mask opacity and predicted-box line thickness.
   - Prompt boxes render as dashed outlines; predicted boxes render as solid outlines.
-  - The currently selected point prompt is outlined in white for easier visual identification.
+  - The currently selected point prompt is outlined in white (1px outside the prompt), and selected boxes get a 1px white outline outside the box perimeter.
+  - Point prompts use a smaller radius; negative prompts render as an `X` only (no circle).
   - Box drag preview uses `QRubberBand` (no drag-time rerender zoom).
 - Navigation / viewing:
   - Frame slider for scrubbing
-  - `Go to` spinbox for direct frame jump
+  - Custom frame jump control with left/right arrows embedded (no up/down buttons)
   - Hotkeys: Left/Right arrows for frame nav, `P` for propagate
   - Mouse wheel zoom
   - Right-click drag pan
   - `Fit to Screen` resets zoom/pan
 - Export:
   - COCO-style JSON + mask PNG files.
+  - Session save/load: JSON + mask PNGs with menu actions; auto-save optional.
 
 ## Memory / GPU Loading Behaviour (important)
 SAM3 is constructed on the first successful directory load, not at app startup. After that, later directory loads reuse the same adapter/model instance and only close any active session. All SAM3 calls run on a dedicated `SamWorker` in a single QThread; the UI sends queued tasks and waits for completion only when it must block.
@@ -119,8 +124,8 @@ python3 -m py_compile surgical_annotator_qt.py tools/exporters/coco_export.py
 
 ## Environment Notes
 - SAM3 runtime deps (Torch/CUDA, model access) must be available in active env.
-- If checkpoint/BPE not provided in UI, SAM3 defaults are used (may require HF access).
-- Checkpoint/BPE changes only affect the first adapter construction in the current app session; after SAM3 is loaded once, later directory loads reuse the existing model instance.
+- If checkpoint not provided in UI, SAM3 defaults are used (may require HF access).
+- Checkpoint changes only affect the first adapter construction in the current app session; after SAM3 is loaded once, later directory loads reuse the existing model instance.
 - Pillow is required (used for single/N-frame PIL sessions).
 
 ## Key Files To Read First
@@ -204,3 +209,9 @@ Before edits, summarize current behavior and your exact implementation plan.
 | 2026-03-16 | Moved all SAM3 calls to a single `SamWorker` (QThread) and reused one adapter for segment/propagate/prefetch |
 | 2026-03-16 | Added 1-frame prefetch caching for right-arrow navigation and prompt-change-triggered prefetch |
 | 2026-03-16 | Tabbed control panel, centered landscape image layout, status bar progress text + cursor coordinates |
+| 2026-03-16 | Added session save/load (JSON + masks) and auto-save controls |
+| 2026-03-16 | Simplified navigation controls with embedded left/right frame jump arrows |
+| 2026-03-16 | Removed advanced prompt toggle; prompt controls always visible |
+| 2026-03-16 | Moved checkpoint selector to Segment/Propagate tab; removed BPE selector |
+| 2026-03-16 | Updated prompt visuals: smaller points, negative X-only, white outlines for selected prompts/boxes |
+| 2026-03-16 | Updated point translation to box-relative mapping (no clamping) and only during propagation |

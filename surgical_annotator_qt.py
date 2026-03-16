@@ -13,8 +13,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from PIL import Image as PilImage
-from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, Signal, Slot, QEventLoop, QMetaObject, Q_ARG
-from PySide6.QtGui import QAction, QBrush, QColor, QImage, QKeySequence, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, Signal, Slot, QEventLoop, QMetaObject, Q_ARG, QTimer
+from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -45,9 +46,14 @@ from sam3.model.sam3_video_predictor import Sam3VideoPredictor
 from tools.exporters.coco_export import CocoExporter, ObjectInfo as ExportObjectInfo
 from tools.exporters.coco_export import PointPrompt as ExportPointPrompt
 from tools.exporters.coco_export import SamFrameOutput as ExportSamFrameOutput
+from tools.session_io import read_mask_png, read_session_json, write_mask_png, write_session_json
 
 MAX_POINTS_PER_OBJECT = 6
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+DEFAULT_CANVAS_SIZE = (960, 540)
+WINDOW_SCREEN_FRACTION = 0.85
+CANVAS_SCREEN_FRACTION = (0.7, 0.6)
+CANVAS_SCREEN_MARGIN_PX = 40
 
 
 @dataclass
@@ -383,16 +389,24 @@ class ClickableImageLabel(QLabel):
     def __init__(self, parent: "AnnotatorMainWindow"):
         super().__init__()
         self.parent_window = parent
+        self._target_size = DEFAULT_CANVAS_SIZE
         self.setAlignment(Qt.AlignCenter)
         # Keep layout stable while allowing full fit-to-panel rendering.
-        self.setMinimumSize(1, 1)
+        self.setMinimumSize(*self._target_size)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setScaledContents(False)
         self.setStyleSheet("background-color: #111; border: 1px solid #444; color: #ddd;")
         self.setMouseTracking(True)
 
+    def set_target_size(self, width: int, height: int) -> None:
+        width = max(1, int(width))
+        height = max(1, int(height))
+        self._target_size = (width, height)
+        self.setMinimumSize(width, height)
+        self.updateGeometry()
+
     def sizeHint(self):
-        return QSize(960, 540)
+        return QSize(*self._target_size)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
@@ -427,6 +441,54 @@ class ClickableImageLabel(QLabel):
             event.angleDelta().y(),
         )
         event.accept()
+
+
+class ArrowSpinBox(QWidget):
+    valueChanged = Signal(int)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self._prev_btn = QToolButton(self)
+        self._prev_btn.setText("<")
+        self._prev_btn.setAutoRepeat(True)
+
+        self._spin = QSpinBox(self)
+        self._spin.setButtonSymbols(QSpinBox.NoButtons)
+        self._spin.valueChanged.connect(self.valueChanged.emit)
+
+        self._next_btn = QToolButton(self)
+        self._next_btn.setText(">")
+        self._next_btn.setAutoRepeat(True)
+
+        layout.addWidget(self._prev_btn)
+        layout.addWidget(self._spin, 1)
+        layout.addWidget(self._next_btn)
+
+        self._prev_btn.clicked.connect(self._spin.stepDown)
+        self._next_btn.clicked.connect(self._spin.stepUp)
+
+    def setMinimum(self, value: int) -> None:
+        self._spin.setMinimum(value)
+
+    def setMaximum(self, value: int) -> None:
+        self._spin.setMaximum(value)
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        self._spin.setRange(minimum, maximum)
+
+    def setValue(self, value: int) -> None:
+        self._spin.setValue(value)
+
+    def value(self) -> int:
+        return self._spin.value()
+
+    def blockSignals(self, block: bool) -> bool:
+        self._spin.blockSignals(block)
+        return super().blockSignals(block)
 
 
 class Sam3Adapter:
@@ -533,7 +595,7 @@ class AnnotatorMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SAM3 Surgical Video Annotator")
-        self.resize(1600, 900)
+        self._apply_window_sizing()
 
         self.sam_adapter: Optional[Sam3Adapter] = None
         self._checkpoint_path: Optional[str] = None
@@ -590,6 +652,9 @@ class AnnotatorMainWindow(QMainWindow):
         self._prefetch_cached_frame_idx: Optional[int] = None
         self._prefetch_cached_seed_idx: Optional[int] = None
         self._prefetch_cached_version: Optional[int] = None
+        self._session_dir: Optional[Path] = None
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._handle_autosave)
         self._box_draw_start_xy: Optional[Tuple[int, int]] = None
         self._box_draw_start_ui_xy: Optional[Tuple[int, int]] = None
         self._box_edit_active: bool = False
@@ -597,7 +662,6 @@ class AnnotatorMainWindow(QMainWindow):
         self._box_drag_reference_box: Optional[BoxPrompt] = None
         self._box_drag_offset_xy: Tuple[int, int] = (0, 0)
         self._selected_box_obj_id: Optional[int] = None
-        self.show_advanced_controls: bool = False
         self.show_prompts: bool = True
         self.show_segmentations: bool = True
         self.show_boxes: bool = True
@@ -607,6 +671,40 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_line_thickness: int = 2
 
         self._setup_ui()
+        QTimer.singleShot(0, self._apply_canvas_sizing)
+
+    def _get_available_screen_geometry(self) -> QRect:
+        screen = self.windowHandle().screen() if self.windowHandle() else QGuiApplication.primaryScreen()
+        if screen is None:
+            return QRect(0, 0, 1600, 900)
+        return screen.availableGeometry()
+
+    def _apply_window_sizing(self) -> None:
+        geom = self._get_available_screen_geometry()
+        avail_w = max(1, geom.width())
+        avail_h = max(1, geom.height())
+        win_w = max(1, int(avail_w * WINDOW_SCREEN_FRACTION))
+        win_h = max(1, int(avail_h * WINDOW_SCREEN_FRACTION))
+        self.resize(win_w, win_h)
+
+    def _apply_canvas_sizing(self) -> None:
+        geom = self._get_available_screen_geometry()
+        avail_w = max(1, geom.width())
+        avail_h = max(1, geom.height())
+        win_w = max(1, self.width() or avail_w)
+        win_h = max(1, self.height() or avail_h)
+        target_w = max(1, int(avail_w * CANVAS_SCREEN_FRACTION[0]))
+        target_h = max(1, int(avail_h * CANVAS_SCREEN_FRACTION[1]))
+        cap_w = max(1, avail_w - CANVAS_SCREEN_MARGIN_PX)
+        cap_h = max(1, avail_h - CANVAS_SCREEN_MARGIN_PX)
+        left_w = self._left_placeholder.minimumWidth() if hasattr(self, "_left_placeholder") else 0
+        right_w = (
+            self._right_panel.sizeHint().width() if hasattr(self, "_right_panel") else 0
+        )
+        available_canvas_w = max(1, win_w - left_w - right_w - CANVAS_SCREEN_MARGIN_PX)
+        target_w = min(target_w, cap_w, available_canvas_w)
+        target_h = min(target_h, cap_h, int(win_h * CANVAS_SCREEN_FRACTION[1]))
+        self.image_label.set_target_size(target_w, target_h)
 
     def _setup_ui(self) -> None:
         load_action = QAction("Load Frame Directory", self)
@@ -617,6 +715,14 @@ class AnnotatorMainWindow(QMainWindow):
         export_action.triggered.connect(self.export_annotations)
         self.menuBar().addAction(export_action)
 
+        save_action = QAction("Save Session", self)
+        save_action.triggered.connect(self.save_session_dialog)
+        self.menuBar().addAction(save_action)
+
+        load_session_action = QAction("Load Session", self)
+        load_session_action.triggered.connect(self.load_session_dialog)
+        self.menuBar().addAction(load_session_action)
+
         root = QWidget()
         root_layout = QHBoxLayout(root)
 
@@ -625,15 +731,12 @@ class AnnotatorMainWindow(QMainWindow):
 
         left_placeholder = QWidget()
         left_placeholder.setMinimumWidth(200)
+        self._left_placeholder = left_placeholder
 
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
 
         nav_row = QHBoxLayout()
-        self.prev_btn = QPushButton("Prev")
-        self.prev_btn.clicked.connect(self.go_prev_frame)
-        self.next_btn = QPushButton("Next")
-        self.next_btn.clicked.connect(self.go_next_frame)
         self.fit_view_btn = QPushButton("Fit to Screen")
         self.fit_view_btn.clicked.connect(self.fit_current_frame_to_view)
         self.frame_slider = QSlider(Qt.Horizontal)
@@ -641,17 +744,14 @@ class AnnotatorMainWindow(QMainWindow):
         self.frame_slider.setMaximum(1)
         self.frame_slider.setValue(1)
         self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
-        self.frame_jump_spin = QSpinBox()
+        self.frame_label = QLabel("Frame: -/-")
+        self.frame_jump_spin = ArrowSpinBox()
         self.frame_jump_spin.setMinimum(1)
         self.frame_jump_spin.setMaximum(1)
         self.frame_jump_spin.setValue(1)
         self.frame_jump_spin.valueChanged.connect(self._on_frame_jump_changed)
-        self.frame_label = QLabel("Frame: -/-")
-        nav_row.addWidget(self.prev_btn)
-        nav_row.addWidget(self.next_btn)
         nav_row.addWidget(self.fit_view_btn)
         nav_row.addWidget(self.frame_slider, 1)
-        nav_row.addWidget(QLabel("Go to:"))
         nav_row.addWidget(self.frame_jump_spin)
         nav_row.addWidget(self.frame_label)
         center_layout.addLayout(nav_row)
@@ -662,6 +762,7 @@ class AnnotatorMainWindow(QMainWindow):
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+        self._right_panel = right_panel
         control_tabs = QTabWidget()
         right_layout.addWidget(control_tabs)
 
@@ -676,13 +777,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.checkpoint_combo.setEditable(True)
         self.checkpoint_combo.lineEdit().setPlaceholderText("Optional local checkpoint path")
         model_form.addRow("Checkpoint", self.checkpoint_combo)
-
-        self.bpe_combo = QComboBox()
-        self.bpe_combo.addItem("Use default BPE")
-        self.bpe_combo.setEditable(True)
-        self.bpe_combo.lineEdit().setPlaceholderText("Optional local BPE path")
-        model_form.addRow("BPE", self.bpe_combo)
-        prompt_layout.addLayout(model_form)
+        processing_layout.addLayout(model_form)
 
         self.object_list = QListWidget()
         self.object_list.currentItemChanged.connect(self._on_object_selection_changed)
@@ -709,7 +804,20 @@ class AnnotatorMainWindow(QMainWindow):
         self.translate_prompts_check.toggled.connect(self._on_translate_prompts_toggled)
         processing_layout.addWidget(self.translate_prompts_check)
 
-        self.prompt_mode_label = QLabel("Advanced Prompt Mode")
+        autosave_row = QHBoxLayout()
+        self.autosave_check = QCheckBox("Auto-save")
+        self.autosave_check.toggled.connect(self._on_autosave_toggled)
+        self.autosave_minutes_spin = QSpinBox()
+        self.autosave_minutes_spin.setMinimum(1)
+        self.autosave_minutes_spin.setMaximum(60)
+        self.autosave_minutes_spin.setValue(5)
+        self.autosave_minutes_spin.valueChanged.connect(self._on_autosave_interval_changed)
+        autosave_row.addWidget(self.autosave_check)
+        autosave_row.addWidget(QLabel("Minutes:"))
+        autosave_row.addWidget(self.autosave_minutes_spin)
+        processing_layout.addLayout(autosave_row)
+
+        self.prompt_mode_label = QLabel("Prompt Mode")
         prompt_layout.addWidget(self.prompt_mode_label)
         self.prompt_mode_combo = QComboBox()
         self.prompt_mode_combo.addItems(["Positive (+)", "Negative (-)", "Box (drag)"])
@@ -738,10 +846,6 @@ class AnnotatorMainWindow(QMainWindow):
         self.segment_btn = QPushButton("Segment")
         self.segment_btn.clicked.connect(self.segment_current_frame)
         processing_layout.addWidget(self.segment_btn)
-
-        self.advanced_controls_check = QCheckBox("Show Advanced Prompt Controls")
-        self.advanced_controls_check.toggled.connect(self._on_advanced_controls_toggled)
-        prompt_layout.addWidget(self.advanced_controls_check)
 
         processing_layout.addWidget(QLabel("View"))
         self.show_prompts_check = QCheckBox("Show Prompts")
@@ -826,12 +930,13 @@ class AnnotatorMainWindow(QMainWindow):
             self.segment_btn,
             self.show_prompts_check,
         ]
-        self._set_advanced_controls_visible(False)
+        self._set_advanced_controls_visible(True)
         self.mode_label.setText("Mode: Box Annotation")
 
         splitter.addWidget(left_placeholder)
         splitter.addWidget(center_panel)
         splitter.addWidget(right_panel)
+        self._root_splitter = splitter
         splitter.setSizes([200, 1100, 500])
 
         self.setCentralWidget(root)
@@ -858,6 +963,32 @@ class AnnotatorMainWindow(QMainWindow):
     def _on_translate_prompts_toggled(self, checked: bool) -> None:
         self.translate_prompts_on_propagation = checked
 
+    def _on_autosave_toggled(self, checked: bool) -> None:
+        if checked:
+            if self._session_dir is None:
+                QMessageBox.information(self, "Auto-save", "Save a session once to choose a folder before auto-save.")
+                self.autosave_check.blockSignals(True)
+                self.autosave_check.setChecked(False)
+                self.autosave_check.blockSignals(False)
+                return
+            self._start_autosave_timer()
+        else:
+            self._autosave_timer.stop()
+
+    def _on_autosave_interval_changed(self, _value: int) -> None:
+        if self.autosave_check.isChecked():
+            self._start_autosave_timer()
+
+    def _start_autosave_timer(self) -> None:
+        interval_ms = int(self.autosave_minutes_spin.value() * 60 * 1000)
+        self._autosave_timer.stop()
+        self._autosave_timer.start(interval_ms)
+
+    def _handle_autosave(self) -> None:
+        if self._session_dir is None or not self.frame_paths:
+            return
+        self._save_session(self._session_dir)
+
     def _on_lock_current_box_toggled(self, checked: bool) -> None:
         if self.active_object_id is None:
             self.lock_current_box_check.blockSignals(True)
@@ -872,12 +1003,6 @@ class AnnotatorMainWindow(QMainWindow):
             return
         self._set_current_box_locked(self.current_frame_idx, self.active_object_id, checked)
         self.refresh_point_list()
-        self._render_current_frame()
-
-    def _on_advanced_controls_toggled(self, checked: bool) -> None:
-        self.show_advanced_controls = checked
-        self._set_advanced_controls_visible(checked)
-        self.mode_label.setText("Mode: Prompt" if self._use_point_prompt_mode() else "Mode: Box Annotation")
         self._render_current_frame()
 
     def _set_advanced_controls_visible(self, visible: bool) -> None:
@@ -1074,12 +1199,11 @@ class AnnotatorMainWindow(QMainWindow):
         self.clear_points_btn.setEnabled(enabled)
         self.lock_current_box_check.setEnabled(enabled)
         self.prompt_mode_combo.setEnabled(enabled)
-        self.advanced_controls_check.setEnabled(enabled)
-        self.prev_btn.setEnabled(enabled)
-        self.next_btn.setEnabled(enabled)
         self.fit_view_btn.setEnabled(enabled)
         self.frame_slider.setEnabled(enabled)
         self.frame_jump_spin.setEnabled(enabled)
+        self.autosave_check.setEnabled(enabled)
+        self.autosave_minutes_spin.setEnabled(enabled)
 
     def _sync_current_box_lock_check(self) -> None:
         has_box = False
@@ -1094,7 +1218,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.lock_current_box_check.blockSignals(False)
 
     def _use_point_prompt_mode(self) -> bool:
-        return self.show_advanced_controls and self.prompt_mode_combo.currentIndex() != 2
+        return self.prompt_mode_combo.currentIndex() != 2
 
     def load_frame_directory(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Select Frame Directory")
@@ -1110,7 +1234,7 @@ class AnnotatorMainWindow(QMainWindow):
             return
 
         self._checkpoint_path = self._read_optional_combo_path(self.checkpoint_combo)
-        self._bpe_path = self._read_optional_combo_path(self.bpe_combo)
+        self._bpe_path = None
 
         if not self._initialize_sam_worker(show_errors=True):
             return
@@ -1144,10 +1268,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._box_rubber_band.hide()
         self.auto_propagate_next = False
         self.auto_propagate_next_check.setChecked(False)
-        self.show_advanced_controls = False
-        self.advanced_controls_check.setChecked(False)
         self.prompt_mode_combo.setCurrentIndex(2)
-        self._set_advanced_controls_visible(False)
         self._sync_frame_navigation_controls()
         self._refresh_object_list_visuals()
         self._sync_current_box_lock_check()
@@ -1155,6 +1276,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._render_current_frame()
         self._set_status(f"Loaded {len(self.frame_paths)} frames from {dir_path}", progress=1, total=1)
         self._reset_prefetch_state()
+        self._session_dir = None
 
     def _read_optional_combo_path(self, combo: QComboBox) -> Optional[str]:
         text = combo.currentText().strip()
@@ -1409,6 +1531,8 @@ class AnnotatorMainWindow(QMainWindow):
 
         points.append(PointPrompt(x_px=x_px, y_px=y_px, is_positive=self.current_prompt_positive))
         self.refresh_point_list()
+        if self._active_prompt_rows:
+            self.point_list.setCurrentRow(len(self._active_prompt_rows) - 1)
 
         if self.segment_mode:
             self.segment_current_frame()
@@ -1450,6 +1574,8 @@ class AnnotatorMainWindow(QMainWindow):
         frame_boxes[self.active_object_id] = box
         self._selected_box_obj_id = self.active_object_id
         self.refresh_point_list()
+        if self._active_prompt_rows:
+            self.point_list.setCurrentRow(0)
         is_locked = self._is_current_box_locked(self.current_frame_idx, self.active_object_id)
         self._sync_current_box_lock_check()
         if not is_locked:
@@ -2074,7 +2200,7 @@ class AnnotatorMainWindow(QMainWindow):
         merged_output = self._merge_frame_outputs(existing_output, output)
         self.outputs_by_frame[abs_frame_idx] = merged_output
         self._sync_canonical_boxes_from_output(abs_frame_idx, output, preserve_locked=False)
-        self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids)
+        self._carry_prompts_forward(abs_frame_idx - 1, abs_frame_idx, output.obj_ids, translate=False)
         self._prefetch_cached_frame_idx = abs_frame_idx
         self._prefetch_cached_seed_idx = self._prefetch_seed_frame_idx
         self._prefetch_cached_version = self._prefetch_active_version
@@ -2489,6 +2615,8 @@ class AnnotatorMainWindow(QMainWindow):
         src_frame_idx: int,
         dst_frame_idx: int,
         obj_ids: List[int],
+        *,
+        translate: bool = True,
     ) -> None:
         src_prompts = self.prompts_by_frame_obj.get(src_frame_idx, {})
         if not src_prompts:
@@ -2498,7 +2626,7 @@ class AnnotatorMainWindow(QMainWindow):
             points = src_prompts.get(obj_id)
             if not points:
                 continue
-            if self.translate_prompts_on_propagation:
+            if translate and self.translate_prompts_on_propagation:
                 dst_prompts[obj_id] = self._translate_prompts_by_box_delta(
                     src_frame_idx=src_frame_idx,
                     dst_frame_idx=dst_frame_idx,
@@ -2528,17 +2656,17 @@ class AnnotatorMainWindow(QMainWindow):
             ]
 
         width, height = frame_size
-        src_cx = (src_box.x1_px + src_box.x2_px) / 2.0
-        src_cy = (src_box.y1_px + src_box.y2_px) / 2.0
-        dst_cx = (dst_box.x1_px + dst_box.x2_px) / 2.0
-        dst_cy = (dst_box.y1_px + dst_box.y2_px) / 2.0
-        delta_x = dst_cx - src_cx
-        delta_y = dst_cy - src_cy
+        src_w = max(1, src_box.x2_px - src_box.x1_px)
+        src_h = max(1, src_box.y2_px - src_box.y1_px)
+        dst_w = max(1, dst_box.x2_px - dst_box.x1_px)
+        dst_h = max(1, dst_box.y2_px - dst_box.y1_px)
 
         translated: List[PointPrompt] = []
         for p in points:
-            x_px = int(round(p.x_px + delta_x))
-            y_px = int(round(p.y_px + delta_y))
+            u = (p.x_px - src_box.x1_px) / src_w
+            v = (p.y_px - src_box.y1_px) / src_h
+            x_px = int(round(dst_box.x1_px + u * dst_w))
+            y_px = int(round(dst_box.y1_px + v * dst_h))
             x_px = max(0, min(width - 1, x_px))
             y_px = max(0, min(height - 1, y_px))
             translated.append(PointPrompt(x_px=x_px, y_px=y_px, is_positive=p.is_positive))
@@ -2636,6 +2764,288 @@ class AnnotatorMainWindow(QMainWindow):
         )
         QMessageBox.information(self, "Export complete", f"Saved: {json_path}")
 
+    def save_session_dialog(self) -> None:
+        if not self.frame_paths:
+            QMessageBox.information(self, "Nothing to save", "Load a frame directory first.")
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Select Session Folder")
+        if not directory:
+            return
+        session_dir = Path(directory)
+        self._save_session(session_dir)
+        self._session_dir = session_dir
+
+    def load_session_dialog(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Select Session Folder")
+        if not directory:
+            return
+        session_dir = Path(directory)
+        session_path = session_dir / "session.json"
+        if not session_path.exists():
+            QMessageBox.warning(self, "Missing session", "No session.json found in that folder.")
+            return
+        self._load_session(session_path)
+        self._session_dir = session_dir
+
+    def _save_session(self, session_dir: Path) -> None:
+        if self.image_dir is None:
+            return
+        masks_dir = session_dir / "masks"
+        frame_files = [p.name for p in self.frame_paths]
+
+        data = {
+            "version": 1,
+            "frame_dir": str(self.image_dir),
+            "frame_files": frame_files,
+            "current_frame_idx": int(self.current_frame_idx),
+            "active_object_id": int(self.active_object_id) if self.active_object_id is not None else None,
+            "checkpoint_path": self._read_optional_combo_path(self.checkpoint_combo),
+            "objects": [
+                {
+                    "obj_id": obj.obj_id,
+                    "name": obj.name,
+                    "color_bgr": list(obj.color_bgr),
+                }
+                for obj in self.objects
+            ],
+            "prompts": {},
+            "boxes": {},
+            "box_locks": {},
+            "outputs": {},
+            "view": {
+                "show_prompts": self.show_prompts,
+                "show_segmentations": self.show_segmentations,
+                "show_boxes": self.show_boxes,
+                "segmentation_opacity": float(self.segmentation_opacity),
+                "box_line_thickness": int(self.box_line_thickness),
+            },
+            "propagation": {
+                "n_frames": int(self.n_propagate_spin.value()),
+                "chunks": int(self.chunks_spin.value()),
+                "sample_points": int(self.sample_points_spin.value()),
+                "carryover_mode": int(self.carryover_mode_combo.currentIndex()),
+                "pause_between_chunks": bool(self.pause_between_chunks_check.isChecked()),
+                "translate_prompts": bool(self.translate_prompts_on_propagation),
+                "auto_propagate_next": bool(self.auto_propagate_next),
+            },
+            "prompt_mode_index": int(self.prompt_mode_combo.currentIndex()),
+        }
+
+        for frame_idx, per_obj in self.prompts_by_frame_obj.items():
+            data["prompts"][str(frame_idx)] = {}
+            for obj_id, plist in per_obj.items():
+                data["prompts"][str(frame_idx)][str(obj_id)] = [
+                    {"x_px": p.x_px, "y_px": p.y_px, "is_positive": p.is_positive}
+                    for p in plist
+                ]
+
+        for frame_idx, per_obj in self.box_prompts_by_frame_obj.items():
+            data["boxes"][str(frame_idx)] = {}
+            for obj_id, box in per_obj.items():
+                data["boxes"][str(frame_idx)][str(obj_id)] = {
+                    "x1_px": box.x1_px,
+                    "y1_px": box.y1_px,
+                    "x2_px": box.x2_px,
+                    "y2_px": box.y2_px,
+                }
+
+        for frame_idx, per_obj in self.box_locked_by_frame_obj.items():
+            data["box_locks"][str(frame_idx)] = {
+                str(obj_id): bool(locked) for obj_id, locked in per_obj.items()
+            }
+
+        for frame_idx, output in self.outputs_by_frame.items():
+            entry = {
+                "obj_ids": [int(x) for x in output.obj_ids],
+                "boxes_xywh_norm": [list(map(float, b)) for b in output.boxes_xywh_norm],
+                "scores": [float(s) for s in output.scores],
+                "mask_paths": [],
+            }
+            for obj_id, mask in zip(output.obj_ids, output.masks):
+                if mask is None or not np.asarray(mask).any():
+                    entry["mask_paths"].append(None)
+                    continue
+                mask_name = f"frame_{frame_idx:05d}_obj_{int(obj_id)}.png"
+                mask_path = masks_dir / mask_name
+                write_mask_png(mask_path, np.asarray(mask))
+                entry["mask_paths"].append(str(mask_path.relative_to(session_dir)))
+            data["outputs"][str(frame_idx)] = entry
+
+        write_session_json(session_dir / "session.json", data)
+        self._set_status("Session saved.", progress=1, total=1)
+
+    def _load_session(self, session_path: Path) -> None:
+        data = read_session_json(session_path)
+        session_dir = session_path.parent
+        frame_dir = Path(data.get("frame_dir", ""))
+        if not frame_dir.exists():
+            alt_dir = QFileDialog.getExistingDirectory(self, "Select Frame Directory for Session")
+            if not alt_dir:
+                return
+            frame_dir = Path(alt_dir)
+
+        frame_files = data.get("frame_files", [])
+        if not frame_files:
+            QMessageBox.warning(self, "Invalid session", "No frame list found in session.")
+            return
+
+        self.image_dir = frame_dir
+        self.frame_paths = [frame_dir / name for name in frame_files]
+        self.segment_mode = False
+        self.mode_label.setText("Mode: Box Annotation")
+        self._clear_pending_propagation_state()
+        self._box_draw_start_xy = None
+        self._box_draw_start_ui_xy = None
+        self._display_image_size = (0, 0)
+        self._zoom_multiplier = 1.0
+        self._pan_offset_ui = (0.0, 0.0)
+        self._pan_drag_last_ui_xy = None
+        self._box_edit_active = False
+        self._box_drag_mode = None
+        self._box_drag_reference_box = None
+        self._box_drag_offset_xy = (0, 0)
+        self._selected_box_obj_id = None
+        self._box_rubber_band.hide()
+        self._reset_prefetch_state()
+
+        existing_names = {p.name for p in frame_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS}
+        missing = [name for name in frame_files if name not in existing_names]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Missing frames",
+                "Some frames listed in the session were not found in the directory. "
+                "Annotations will still load, but rendering may be incomplete.",
+            )
+
+        self._checkpoint_path = data.get("checkpoint_path")
+        if self._checkpoint_path:
+            self.checkpoint_combo.setCurrentText(self._checkpoint_path)
+        else:
+            self.checkpoint_combo.setCurrentIndex(0)
+
+        self.objects.clear()
+        self.object_list.clear()
+        for entry in data.get("objects", []):
+            obj = ObjectInfo(
+                obj_id=int(entry["obj_id"]),
+                name=entry["name"],
+                color_bgr=tuple(entry.get("color_bgr", (255, 255, 255))),
+            )
+            self.objects.append(obj)
+            item = QListWidgetItem(obj.name)
+            item.setData(Qt.UserRole, obj.obj_id)
+            item.setCheckState(Qt.Checked)
+            item.setForeground(QBrush(QColor(obj.color_bgr[2], obj.color_bgr[1], obj.color_bgr[0])))
+            self.object_list.addItem(item)
+
+        self.next_obj_id = 1 + max((obj.obj_id for obj in self.objects), default=0)
+        self.active_object_id = data.get("active_object_id")
+
+        self.prompts_by_frame_obj.clear()
+        for frame_idx, per_obj in data.get("prompts", {}).items():
+            frame_map: Dict[int, List[PointPrompt]] = {}
+            for obj_id, plist in per_obj.items():
+                frame_map[int(obj_id)] = [
+                    PointPrompt(
+                        x_px=int(p["x_px"]),
+                        y_px=int(p["y_px"]),
+                        is_positive=bool(p["is_positive"]),
+                    )
+                    for p in plist
+                ]
+            self.prompts_by_frame_obj[int(frame_idx)] = frame_map
+
+        self.box_prompts_by_frame_obj.clear()
+        for frame_idx, per_obj in data.get("boxes", {}).items():
+            frame_map: Dict[int, BoxPrompt] = {}
+            for obj_id, box in per_obj.items():
+                frame_map[int(obj_id)] = BoxPrompt(
+                    x1_px=int(box["x1_px"]),
+                    y1_px=int(box["y1_px"]),
+                    x2_px=int(box["x2_px"]),
+                    y2_px=int(box["y2_px"]),
+                )
+            self.box_prompts_by_frame_obj[int(frame_idx)] = frame_map
+
+        self.box_locked_by_frame_obj.clear()
+        for frame_idx, per_obj in data.get("box_locks", {}).items():
+            self.box_locked_by_frame_obj[int(frame_idx)] = {
+                int(obj_id): bool(locked) for obj_id, locked in per_obj.items()
+            }
+
+        self.outputs_by_frame.clear()
+        for frame_idx, entry in data.get("outputs", {}).items():
+            frame_idx_int = int(frame_idx)
+            obj_ids = [int(x) for x in entry.get("obj_ids", [])]
+            boxes = [tuple(map(float, b)) for b in entry.get("boxes_xywh_norm", [])]
+            scores = [float(s) for s in entry.get("scores", [])]
+            mask_paths = entry.get("mask_paths", [])
+            masks: List[np.ndarray] = []
+            frame_size = self._get_frame_size(frame_idx_int)
+            fallback_shape = (1, 1) if frame_size is None else (frame_size[1], frame_size[0])
+            for idx in range(len(obj_ids)):
+                path = mask_paths[idx] if idx < len(mask_paths) else None
+                if path is None:
+                    masks.append(np.zeros(fallback_shape, dtype=bool))
+                    continue
+                try:
+                    masks.append(read_mask_png(session_dir / path))
+                except Exception:
+                    masks.append(np.zeros(fallback_shape, dtype=bool))
+            self.outputs_by_frame[frame_idx_int] = SamFrameOutput(
+                obj_ids=obj_ids,
+                masks=masks,
+                boxes_xywh_norm=boxes,
+                scores=scores,
+            )
+
+        if self.outputs_by_frame:
+            self.segment_mode = True
+            self.mode_label.setText("Mode: Segment" if self._use_point_prompt_mode() else "Mode: Box Annotation")
+
+        view = data.get("view", {})
+        self.show_prompts = bool(view.get("show_prompts", True))
+        self.show_segmentations = bool(view.get("show_segmentations", True))
+        self.show_boxes = bool(view.get("show_boxes", True))
+        self.segmentation_opacity = float(view.get("segmentation_opacity", self.segmentation_opacity))
+        self.box_line_thickness = int(view.get("box_line_thickness", self.box_line_thickness))
+        self.show_prompts_check.setChecked(self.show_prompts)
+        self.show_segmentations_check.setChecked(self.show_segmentations)
+        self.show_boxes_check.setChecked(self.show_boxes)
+        self.segmentation_opacity_spin.setValue(self.segmentation_opacity)
+        self.box_line_thickness_spin.setValue(self.box_line_thickness)
+
+        propagation = data.get("propagation", {})
+        self.n_propagate_spin.setValue(int(propagation.get("n_frames", self.n_propagate_spin.value())))
+        self.chunks_spin.setValue(int(propagation.get("chunks", self.chunks_spin.value())))
+        self.sample_points_spin.setValue(int(propagation.get("sample_points", self.sample_points_spin.value())))
+        self.carryover_mode_combo.setCurrentIndex(int(propagation.get("carryover_mode", 0)))
+        self.pause_between_chunks_check.setChecked(bool(propagation.get("pause_between_chunks", True)))
+        self.translate_prompts_on_propagation = bool(propagation.get("translate_prompts", True))
+        self.translate_prompts_check.setChecked(self.translate_prompts_on_propagation)
+        self.auto_propagate_next = bool(propagation.get("auto_propagate_next", False))
+        self.auto_propagate_next_check.setChecked(self.auto_propagate_next)
+
+        self.prompt_mode_combo.setCurrentIndex(int(data.get("prompt_mode_index", 2)))
+
+        self.current_frame_idx = int(data.get("current_frame_idx", 0))
+        if self.current_frame_idx < 0 or self.current_frame_idx >= len(self.frame_paths):
+            self.current_frame_idx = 0
+
+        self._sync_frame_navigation_controls()
+        self._refresh_object_list_visuals()
+        if self.active_object_id is not None:
+            for i in range(self.object_list.count()):
+                item = self.object_list.item(i)
+                if item and item.data(Qt.UserRole) == self.active_object_id:
+                    self.object_list.setCurrentRow(i)
+                    break
+        self._sync_current_box_lock_check()
+        self.refresh_point_list()
+        self._render_current_frame()
+        self._set_status("Session loaded.", progress=1, total=1)
+
     def _render_current_frame(self) -> None:
         if not self.frame_paths:
             self.image_label.setText("Load a frame directory")
@@ -2713,10 +3123,25 @@ class AnnotatorMainWindow(QMainWindow):
 
     def _draw_points_overlay(self, img: np.ndarray) -> np.ndarray:
         frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
+        selected_box = self._is_selected_box_prompt()
         for obj_id, box in frame_boxes.items():
             obj = self._find_object(obj_id)
             color = obj.color_bgr if obj else (255, 255, 255)
             if self.show_boxes:
+                if selected_box and obj_id == self.active_object_id:
+                    outline_pad = max(1, int(self.box_line_thickness))
+                    self._draw_box_outline(
+                        img,
+                        BoxPrompt(
+                            x1_px=max(0, box.x1_px - outline_pad),
+                            y1_px=max(0, box.y1_px - outline_pad),
+                            x2_px=box.x2_px + outline_pad,
+                            y2_px=box.y2_px + outline_pad,
+                        ),
+                        (255, 255, 255),
+                        1,
+                        dashed=False,
+                    )
                 self._draw_box_outline(img, box, color, self.box_line_thickness, dashed=False)
                 label = obj.name if obj else str(obj_id)
                 if self._is_current_box_locked(self.current_frame_idx, obj_id):
@@ -2741,15 +3166,41 @@ class AnnotatorMainWindow(QMainWindow):
                 obj = self._find_object(obj_id)
                 color = obj.color_bgr if obj else (255, 255, 255)
                 for idx, p in enumerate(plist):
-                    radius = 6
+                    radius = 4
                     if obj_id == self.active_object_id and idx == selected_prompt_idx:
-                        cv2.circle(img, (p.x_px, p.y_px), radius + 3, (255, 255, 255), 2)
+                        cv2.circle(img, (p.x_px, p.y_px), radius + 1, (255, 255, 255), 1)
                     if p.is_positive:
                         cv2.circle(img, (p.x_px, p.y_px), radius, color, -1)
                     else:
-                        cv2.circle(img, (p.x_px, p.y_px), radius, color, 2)
-                        cv2.line(img, (p.x_px - radius, p.y_px - radius), (p.x_px + radius, p.y_px + radius), color, 2)
-                        cv2.line(img, (p.x_px - radius, p.y_px + radius), (p.x_px + radius, p.y_px - radius), color, 2)
+                        if obj_id == self.active_object_id and idx == selected_prompt_idx:
+                            cv2.line(
+                                img,
+                                (p.x_px - (radius + 1), p.y_px - (radius + 1)),
+                                (p.x_px + (radius + 1), p.y_px + (radius + 1)),
+                                (255, 255, 255),
+                                1,
+                            )
+                            cv2.line(
+                                img,
+                                (p.x_px - (radius + 1), p.y_px + (radius + 1)),
+                                (p.x_px + (radius + 1), p.y_px - (radius + 1)),
+                                (255, 255, 255),
+                                1,
+                            )
+                        cv2.line(
+                            img,
+                            (p.x_px - radius, p.y_px - radius),
+                            (p.x_px + radius, p.y_px + radius),
+                            color,
+                            2,
+                        )
+                        cv2.line(
+                            img,
+                            (p.x_px - radius, p.y_px + radius),
+                            (p.x_px + radius, p.y_px - radius),
+                            color,
+                            2,
+                        )
 
         return img
 
@@ -2761,6 +3212,13 @@ class AnnotatorMainWindow(QMainWindow):
         if prompt_type != "point":
             return None
         return idx
+
+    def _is_selected_box_prompt(self) -> bool:
+        row = self.point_list.currentRow()
+        if row < 0 or row >= len(self._active_prompt_rows):
+            return False
+        prompt_type, _idx = self._active_prompt_rows[row]
+        return prompt_type == "box"
 
     def _is_box_mode(self) -> bool:
         return not self._use_point_prompt_mode()
@@ -3226,6 +3684,7 @@ class AnnotatorMainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            self._autosave_timer.stop()
             if self._sam_thread is not None:
                 self._sam_thread.quit()
                 self._sam_thread.wait()
