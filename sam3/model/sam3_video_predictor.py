@@ -12,6 +12,7 @@ import uuid
 from contextlib import closing
 from typing import List, Optional
 
+import numpy as np
 import psutil
 import torch
 
@@ -62,6 +63,13 @@ class Sam3VideoPredictor:
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
+            )
+        elif request_type == "add_mask":
+            return self.add_mask(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+                mask_inputs=request["mask_inputs"],
+                obj_id=request["obj_id"],
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -163,6 +171,23 @@ class Sam3VideoPredictor:
             box_labels=bounding_box_labels,
             mask_inputs=mask_inputs,
             obj_id=obj_id,
+        )
+        return {"frame_index": frame_idx, "outputs": outputs}
+
+    def add_mask(
+        self,
+        session_id: str,
+        frame_idx: int,
+        mask_inputs,
+        obj_id: int,
+    ):
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+        frame_idx, outputs = self.model.add_tracker_new_mask(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask_inputs=mask_inputs,
         )
         return {"frame_index": frame_idx, "outputs": outputs}
 
