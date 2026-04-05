@@ -5,11 +5,14 @@
 - Lets you create objects and set one active object at a time.
 - Each object has a checkbox in the object list to enable/disable propagation for that object.
 - Each object row includes `Prop`, `Rename`, `Solo`, and `Hide` controls.
+- Object rows show the current frame's tracker-side score when available as `trk=...`.
+- Frame-level text prompts can propose multiple instances on the current frame; accepted proposals are converted into normal tracked objects.
 - Uses a single canonical box per object/frame in the main workflow; drawn, propagated, and edited boxes are the same UI annotation.
 - Newly drawn boxes and unlocked box edits are refined on the current frame with SAM3; the visible box is replaced by the box derived from the segmentation.
 - `Lock Current Box` preserves a manual box on the current frame and prevents SAM3 from overwriting it there.
 - The current frame annotation list stays visible in the main UI, including the box plus any point prompts for the active object.
 - View controls now live in the `Prompting` tab, including prompt/segmentation/box visibility, box titles, mask opacity, and box thickness.
+- An `Experimental Features` tab exposes SAM3 periodic re-prompt controls for frame interval, confidence threshold, IoU threshold, and an experimental one-session chunked propagation toggle.
 - Clicks add positive/negative point prompts (up to 6) for active object on current frame.
 - Box prompts can be drawn by selecting `Box (drag)` and dragging on the image.
 - Existing box prompts can be edited while `Box (drag)` mode is active:
@@ -25,6 +28,9 @@
 - Use the frame jump control (left/right arrows + field) to jump directly to a frame number.
 - Hotkeys: Left/Right arrows or `A`/`D` move frame-by-frame, `P` starts propagation.
 - `Auto Propagate Next Frame` can propagate checked objects one frame ahead when the right arrow is used.
+- `Use Point Prompts for Propagation` controls whether current-frame point prompts are included as tracker seed inputs; boxes and seed masks still propagate when it is off.
+- `Use One Session for Chunked Propagation` keeps manual chunking in the UI while reusing one full-video SAM3 session across chunks for that propagation run.
+- `Prop` is frame-local: unlabeled frames show unchecked/disabled, labeled frames auto-check again, and manual unchecks are remembered on that frame.
 - Internally, each box prompt is passed to SAM3 as two point prompts with labels `(2, 3)`.
 - View controls let you independently show/hide prompts, segmentations, and derived boxes.
 - Box titles can be shown/hidden independently from box outlines.
@@ -80,14 +86,25 @@ python3 surgical_annotator_qt.py
    - With the toggle on, pressing the right arrow attempts a one-frame propagation for checked objects before moving to the next frame.
 5. Use the `View` controls to toggle segmentations/boxes and tune mask opacity or box thickness.
 6. Set `Checkpoint` (optional), `N frames`, and either `Chunks` or `Use Target Frame` + `To frame`, plus `Sample pts`, `Carryover` mode, and optional `Pause Between Chunks` when using manual propagation.
-7. Click `Propagate`.
+7. Optionally adjust `Experimental Features` values.
+   - These settings apply live to future tracker operations.
+   - `Re-prompt Every N Frames = 0` disables periodic re-prompting.
+   - `Use One Session for Chunked Propagation` changes how tracker chunk propagation reuses SAM3 session state across chunk boundaries.
+8. Click `Propagate`.
     - Only checked objects are included in propagation.
    - The canonical box on the seed frame is used as the primary propagation input.
    - Use `Pause` to stop after the current chunk or `Stop` to cancel immediately.
    - Enable `Auto-pause if Class Lost` to pause after a class loses its mask and show a warning.
-8. If pause is enabled and chunks remain, review/correct and click `Continue Propagate`.
-9. Use `Save Session` to persist your work (and enable auto-save if desired).
-10. `Export COCO` from menu when done.
+9. If pause is enabled and chunks remain, review/correct and click `Continue Propagate`.
+10. Use `Save Session` to persist your work (and enable auto-save if desired).
+11. `Export COCO` from menu when done.
+
+Text prompt workflow:
+- Enter a frame text prompt such as `dog`.
+- Click `Generate Objects` to produce temporary proposals on the current frame only.
+- Review the proposal list and click `Accept Selected` to convert chosen proposals into regular objects named from the prompt, such as `dog 1`, `dog 2`.
+- Accepted proposals store a mask and canonical box on that frame and then use the normal propagation workflow.
+- Temporary proposals are not saved unless accepted.
 
 Ctrl+Z undoes the last prompt edit (single-step).
 
@@ -104,4 +121,8 @@ Ctrl+Z undoes the last prompt edit (single-step).
 - For carryover chunks, if the seed frame has no manual prompts, prompts are sampled from the seed frame's last known masks.
 - In `Mask AABB Box` carryover mode, last masks are converted to axis-aligned boxes and passed as point labels `(2,3)`.
 - Box prompts are not sent via SAM3 box API; they are always translated to point labels `(2,3)`.
+- Text prompts are not tracked prompts. They are only used to generate one-frame proposals that can be accepted into the existing per-object workflow.
+- Experimental periodic re-prompt settings are saved and restored with sessions.
+- The one-session chunked propagation toggle is saved and restored with sessions.
+- Tracker-side scores are saved and restored with sessions for inspection, but are not exported yet.
 - If a chunk returns no valid masks, chunked propagation stops and asks for prompt refinement before retrying.

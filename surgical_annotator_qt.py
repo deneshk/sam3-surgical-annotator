@@ -53,6 +53,7 @@ from tools.exporters.perk_export import BoxPrompt as ExportPerkBoxPrompt
 from tools.exporters.perk_export import ObjectInfo as ExportPerkObjectInfo
 from tools.exporters.perk_export import PerkExporter
 from tools.session_io import read_mask_png, read_session_json, write_mask_png, write_session_json
+from tools.text_prompt_grounding import TextPromptProposal, build_text_prompt_proposals, next_prompt_object_name
 
 MAX_POINTS_PER_OBJECT = 6
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -60,6 +61,9 @@ DEFAULT_CANVAS_SIZE = (960, 540)
 WINDOW_SCREEN_FRACTION = 0.85
 CANVAS_SCREEN_FRACTION = (0.7, 0.6)
 CANVAS_SCREEN_MARGIN_PX = 40
+DEFAULT_RECONDITION_EVERY_NTH_FRAME = 16
+DEFAULT_RECONDITION_HIGH_CONF_THRESH = 0.8
+DEFAULT_RECONDITION_HIGH_IOU_THRESH = 0.8
 
 
 @dataclass
@@ -90,6 +94,7 @@ class SamFrameOutput:
     masks: List[np.ndarray]
     boxes_xywh_norm: List[Tuple[float, float, float, float]]
     scores: List[float]
+    tracker_scores: List[float]
 
 
 @dataclass
@@ -196,21 +201,33 @@ class PropagationWorker(QObject):
 class SamWorker(QObject):
     initialized = Signal(bool, str)
     segment_done = Signal(str, int, object)
+    text_prompt_done = Signal(str, int, object, str)
     propagate_frame = Signal(str, int, object, int, int)
     propagate_done = Signal(str, int, int)
     propagate_stopped = Signal(str, int)
     task_failed = Signal(str, str, bool)
     task_finished = Signal(str)
 
-    def __init__(self, checkpoint_path: Optional[str], bpe_path: Optional[str]) -> None:
+    def __init__(
+        self,
+        checkpoint_path: Optional[str],
+        bpe_path: Optional[str],
+        recondition_every_nth_frame: int,
+        recondition_high_conf_thresh: float,
+        recondition_high_iou_thresh: float,
+    ) -> None:
         super().__init__()
         self.checkpoint_path = checkpoint_path
         self.bpe_path = bpe_path
+        self.recondition_every_nth_frame = recondition_every_nth_frame
+        self.recondition_high_conf_thresh = recondition_high_conf_thresh
+        self.recondition_high_iou_thresh = recondition_high_iou_thresh
         self.sam_adapter: Optional[Sam3Adapter] = None
         self._queue = deque()
         self._busy = False
         self._cancel_prefetch = False
         self._cancel_propagation_event = threading.Event()
+        self._one_session_frame_signature: Optional[Tuple[str, ...]] = None
 
     @Slot()
     def initialize(self) -> None:
@@ -218,6 +235,9 @@ class SamWorker(QObject):
             self.sam_adapter = Sam3Adapter(
                 checkpoint_path=self.checkpoint_path,
                 bpe_path=self.bpe_path,
+                recondition_every_nth_frame=self.recondition_every_nth_frame,
+                recondition_high_conf_thresh=self.recondition_high_conf_thresh,
+                recondition_high_iou_thresh=self.recondition_high_iou_thresh,
             )
         except Exception as exc:
             self.sam_adapter = None
@@ -253,9 +273,14 @@ class SamWorker(QObject):
                 self.task_failed.emit(task_id, "SAM3 not initialized.", False)
             elif task_type == "close_session":
                 self.sam_adapter.close_session()
+                self._one_session_frame_signature = None
                 self.task_finished.emit(task_id)
             elif task_type == "segment":
                 self._run_segment(task_id, payload)
+            elif task_type == "text_prompt":
+                self._run_text_prompt(task_id, payload)
+            elif task_type == "update_experimental_settings":
+                self._run_update_experimental_settings(task_id, payload)
             elif task_type in {"propagate", "prefetch"}:
                 self._run_propagate(task_id, payload, task_type == "prefetch")
             else:
@@ -286,7 +311,8 @@ class SamWorker(QObject):
             return
         img_pil = PilImage.open(str(img_path))
         self.sam_adapter.start_session([img_pil])
-        composite = SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[])
+        self._one_session_frame_signature = None
+        composite = SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[])
         for obj_id, p in obj_payload.items():
             points_rel = p.get("points_rel", [])
             labels = p.get("labels", [])
@@ -306,9 +332,48 @@ class SamWorker(QObject):
                 masks=[result.masks[ridx]],
                 boxes_xywh_norm=[result.boxes_xywh_norm[ridx]],
                 scores=[result.scores[ridx]],
+                tracker_scores=[result.tracker_scores[ridx] if ridx < len(result.tracker_scores) else 0.0],
             )
             composite = _merge_outputs_for_worker(composite, obj_output)
         self.segment_done.emit(task_id, frame_idx, composite)
+
+    def _run_text_prompt(self, task_id: str, payload: object) -> None:
+        data = payload or {}
+        frame_idx = int(data.get("frame_idx", -1))
+        text_prompt = str(data.get("text_prompt", "")).strip()
+        if frame_idx < 0:
+            self.task_failed.emit(task_id, "Invalid frame index.", False)
+            return
+        if not text_prompt:
+            self.task_failed.emit(task_id, "Enter a text prompt first.", True)
+            return
+        img_path = data.get("frame_path")
+        if not img_path:
+            self.task_failed.emit(task_id, "Missing frame path.", False)
+            return
+        img_pil = PilImage.open(str(img_path))
+        self.sam_adapter.start_session([img_pil])
+        self._one_session_frame_signature = None
+        result = self.sam_adapter.add_text_prompt(frame_idx=0, text=text_prompt)
+        self.text_prompt_done.emit(task_id, frame_idx, result, text_prompt)
+
+    def _run_update_experimental_settings(self, task_id: str, payload: object) -> None:
+        data = payload or {}
+        self.recondition_every_nth_frame = int(
+            data.get("recondition_every_nth_frame", self.recondition_every_nth_frame)
+        )
+        self.recondition_high_conf_thresh = float(
+            data.get("recondition_high_conf_thresh", self.recondition_high_conf_thresh)
+        )
+        self.recondition_high_iou_thresh = float(
+            data.get("recondition_high_iou_thresh", self.recondition_high_iou_thresh)
+        )
+        self.sam_adapter.update_experimental_settings(
+            self.recondition_every_nth_frame,
+            self.recondition_high_conf_thresh,
+            self.recondition_high_iou_thresh,
+        )
+        self.task_finished.emit(task_id)
 
     def _run_propagate(self, task_id: str, payload: object, is_prefetch: bool) -> None:
         data = payload or {}
@@ -316,6 +381,8 @@ class SamWorker(QObject):
         n_frames = int(data.get("n_frames", 0))
         frame_paths = data.get("frame_paths", [])
         prompt_payload = data.get("prompt_payload", {})
+        use_one_session = bool(data.get("use_one_session", False)) and not is_prefetch
+        rebuild_one_session = bool(data.get("rebuild_one_session", False))
         if seed_frame_idx < 0 or n_frames <= 1:
             self.task_failed.emit(task_id, "No forward frames available from current seed frame.", True)
             return
@@ -328,8 +395,16 @@ class SamWorker(QObject):
         if not is_prefetch:
             self._cancel_propagation_event.clear()
 
-        imgs_pil = [PilImage.open(str(frame_paths[i])) for i in range(abs_start, abs_end)]
-        self.sam_adapter.start_session(imgs_pil)
+        frame_signature = tuple(str(Path(p)) for p in frame_paths)
+        if use_one_session:
+            if rebuild_one_session or self.sam_adapter.session_id is None or self._one_session_frame_signature != frame_signature:
+                imgs_pil = [PilImage.open(str(frame_path)) for frame_path in frame_paths]
+                self.sam_adapter.start_session(imgs_pil)
+                self._one_session_frame_signature = frame_signature
+        else:
+            imgs_pil = [PilImage.open(str(frame_paths[i])) for i in range(abs_start, abs_end)]
+            self.sam_adapter.start_session(imgs_pil)
+            self._one_session_frame_signature = None
         for obj_id, p in prompt_payload.items():
             points_rel = p.get("points_rel", [])
             labels = p.get("labels", [])
@@ -337,7 +412,7 @@ class SamWorker(QObject):
             if not points_rel:
                 continue
             self.sam_adapter.add_object_points(
-                frame_idx=0,
+                frame_idx=abs_start if use_one_session else 0,
                 obj_id=int(obj_id),
                 points_rel=points_rel,
                 labels=labels,
@@ -346,9 +421,10 @@ class SamWorker(QObject):
 
         last_masked_frame_idx: Optional[int] = None
         last_emitted_frame_idx = abs_start - 1
+        max_frames = (actual_n - 1) if use_one_session else actual_n
         for session_idx, output in self.sam_adapter.propagate_n_frames_stream(
-            start_frame_idx=0,
-            max_frames=actual_n,
+            start_frame_idx=abs_start if use_one_session else 0,
+            max_frames=max_frames,
         ):
             if not is_prefetch and self._cancel_propagation_event.is_set():
                 self._cancel_propagation_event.clear()
@@ -356,9 +432,10 @@ class SamWorker(QObject):
                 return
             if is_prefetch and self._cancel_prefetch:
                 continue
-            abs_frame_idx = abs_start + int(session_idx)
+            abs_frame_idx = int(session_idx) if use_one_session else abs_start + int(session_idx)
             last_emitted_frame_idx = abs_frame_idx
-            self.propagate_frame.emit(task_id, abs_frame_idx, output, int(session_idx), actual_n)
+            chunk_session_idx = abs_frame_idx - abs_start
+            self.propagate_frame.emit(task_id, abs_frame_idx, output, int(chunk_session_idx), actual_n)
             for mask in output.masks:
                 if np.asarray(mask).any():
                     last_masked_frame_idx = abs_frame_idx
@@ -385,22 +462,26 @@ def _merge_outputs_for_worker(base_output: SamFrameOutput, new_output: SamFrameO
         masks=list(base_output.masks),
         boxes_xywh_norm=list(base_output.boxes_xywh_norm),
         scores=list(base_output.scores),
+        tracker_scores=list(base_output.tracker_scores),
     )
     obj_to_idx = {obj_id: i for i, obj_id in enumerate(merged.obj_ids)}
     for i, obj_id in enumerate(new_output.obj_ids):
         if i >= len(new_output.masks) or i >= len(new_output.boxes_xywh_norm):
             continue
         score = new_output.scores[i] if i < len(new_output.scores) else 0.0
+        tracker_score = new_output.tracker_scores[i] if i < len(new_output.tracker_scores) else 0.0
         if obj_id in obj_to_idx:
             idx = obj_to_idx[obj_id]
             merged.masks[idx] = new_output.masks[i]
             merged.boxes_xywh_norm[idx] = new_output.boxes_xywh_norm[i]
             merged.scores[idx] = score
+            merged.tracker_scores[idx] = tracker_score
         else:
             merged.obj_ids.append(obj_id)
             merged.masks.append(new_output.masks[i])
             merged.boxes_xywh_norm.append(new_output.boxes_xywh_norm[i])
             merged.scores.append(score)
+            merged.tracker_scores.append(tracker_score)
             obj_to_idx[obj_id] = len(merged.obj_ids) - 1
     return merged
 
@@ -565,10 +646,16 @@ class Sam3Adapter:
         self,
         checkpoint_path: Optional[str] = None,
         bpe_path: Optional[str] = None,
+        recondition_every_nth_frame: int = DEFAULT_RECONDITION_EVERY_NTH_FRAME,
+        recondition_high_conf_thresh: float = DEFAULT_RECONDITION_HIGH_CONF_THRESH,
+        recondition_high_iou_thresh: float = DEFAULT_RECONDITION_HIGH_IOU_THRESH,
     ) -> None:
         self.predictor = Sam3VideoPredictor(
             checkpoint_path=checkpoint_path,
             bpe_path=bpe_path,
+            recondition_every_nth_frame=recondition_every_nth_frame,
+            recondition_high_conf_thresh=recondition_high_conf_thresh,
+            recondition_high_iou_thresh=recondition_high_iou_thresh,
         )
         self.session_id: Optional[str] = None
 
@@ -632,6 +719,34 @@ class Sam3Adapter:
         )
         return self._parse_output(response["outputs"])
 
+    def add_text_prompt(
+        self,
+        frame_idx: int,
+        text: str,
+    ) -> SamFrameOutput:
+        if not self.session_id:
+            raise RuntimeError("No active SAM3 session")
+        response = self.predictor.handle_request(
+            request={
+                "type": "add_prompt",
+                "session_id": self.session_id,
+                "frame_index": frame_idx,
+                "text": text,
+            }
+        )
+        return self._parse_output(response["outputs"])
+
+    def update_experimental_settings(
+        self,
+        recondition_every_nth_frame: int,
+        recondition_high_conf_thresh: float,
+        recondition_high_iou_thresh: float,
+    ) -> None:
+        model = self.predictor.model
+        model.recondition_every_nth_frame = int(recondition_every_nth_frame)
+        model.recondition_high_conf_thresh = float(recondition_high_conf_thresh)
+        model.recondition_high_iou_thresh = float(recondition_high_iou_thresh)
+
     def propagate_n_frames(
         self, start_frame_idx: int, max_frames: int
     ) -> Dict[int, SamFrameOutput]:
@@ -673,7 +788,16 @@ class Sam3Adapter:
         masks = [np.asarray(m).astype(bool) for m in outputs.get("out_binary_masks", [])]
         boxes = [tuple(map(float, b)) for b in outputs.get("out_boxes_xywh", [])]
         scores = [float(x) for x in outputs.get("out_probs", [])]
-        return SamFrameOutput(obj_ids=obj_ids, masks=masks, boxes_xywh_norm=boxes, scores=scores)
+        tracker_scores = [float(x) for x in outputs.get("out_tracker_probs", [])]
+        if len(tracker_scores) < len(obj_ids):
+            tracker_scores.extend([0.0] * (len(obj_ids) - len(tracker_scores)))
+        return SamFrameOutput(
+            obj_ids=obj_ids,
+            masks=masks,
+            boxes_xywh_norm=boxes,
+            scores=scores,
+            tracker_scores=tracker_scores,
+        )
 
 
 class AnnotatorMainWindow(QMainWindow):
@@ -702,6 +826,10 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_prompts_by_frame_obj: Dict[int, Dict[int, BoxPrompt]] = {}
         self.box_locked_by_frame_obj: Dict[int, Dict[int, bool]] = {}
         self.outputs_by_frame: Dict[int, SamFrameOutput] = {}
+        self.manual_propagation_overrides_by_frame_obj: Dict[int, Dict[int, bool]] = {}
+        self._text_prompt_proposals_frame_idx: Optional[int] = None
+        self._text_prompt_last_prompt: str = ""
+        self._text_prompt_proposals: List[TextPromptProposal] = []
         self._active_prompt_rows: List[Tuple[str, int]] = []
 
         self.segment_mode: bool = False
@@ -750,6 +878,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._output_version_by_frame: Dict[int, int] = {}
         self._undo_state: Optional[dict] = None
         self._last_prompt_edit_frame: Optional[int] = None
+        self._one_session_chunk_prompt_version: Optional[int] = None
         self._session_dir: Optional[Path] = None
         self._autosave_timer = QTimer(self)
         self._autosave_timer.timeout.connect(self._handle_autosave)
@@ -767,9 +896,14 @@ class AnnotatorMainWindow(QMainWindow):
         self.auto_propagate_next: bool = False
         self.propagation_mode: str = "tracker"
         self.translate_prompts_on_propagation: bool = True
+        self.use_point_prompts_for_propagation: bool = True
         self.use_target_frame: bool = False
+        self.use_one_session_chunked_propagation: bool = False
         self.segmentation_opacity: float = 0.6
         self.box_line_thickness: int = 2
+        self.recondition_every_nth_frame: int = DEFAULT_RECONDITION_EVERY_NTH_FRAME
+        self.recondition_high_conf_thresh: float = DEFAULT_RECONDITION_HIGH_CONF_THRESH
+        self.recondition_high_iou_thresh: float = DEFAULT_RECONDITION_HIGH_IOU_THRESH
 
         self._setup_ui()
         QTimer.singleShot(0, self._apply_canvas_sizing)
@@ -942,6 +1076,8 @@ class AnnotatorMainWindow(QMainWindow):
         prompt_layout = QVBoxLayout(prompt_tab)
         processing_tab = QWidget()
         processing_layout = QVBoxLayout(processing_tab)
+        experimental_tab = QWidget()
+        experimental_layout = QVBoxLayout(experimental_tab)
 
         model_form = QFormLayout()
         self.checkpoint_combo = QComboBox()
@@ -967,6 +1103,26 @@ class AnnotatorMainWindow(QMainWindow):
         obj_row.addWidget(self.remove_obj_btn)
         prompt_layout.addLayout(obj_row)
 
+        self.text_prompt_input = QLineEdit()
+        self.text_prompt_input.setPlaceholderText("Frame text prompt, e.g. dog")
+        prompt_layout.addWidget(QLabel("Text Prompt Objects"))
+        prompt_layout.addWidget(self.text_prompt_input)
+
+        text_prompt_row = QHBoxLayout()
+        self.generate_text_prompt_btn = QPushButton("Generate Objects")
+        self.generate_text_prompt_btn.clicked.connect(self.generate_objects_from_text_prompt)
+        self.accept_text_prompt_btn = QPushButton("Accept Selected")
+        self.accept_text_prompt_btn.clicked.connect(self.accept_selected_text_prompt_proposals)
+        self.clear_text_prompt_btn = QPushButton("Clear Proposals")
+        self.clear_text_prompt_btn.clicked.connect(self.clear_text_prompt_proposals)
+        text_prompt_row.addWidget(self.generate_text_prompt_btn)
+        text_prompt_row.addWidget(self.accept_text_prompt_btn)
+        text_prompt_row.addWidget(self.clear_text_prompt_btn)
+        prompt_layout.addLayout(text_prompt_row)
+
+        self.text_prompt_list = QListWidget()
+        prompt_layout.addWidget(self.text_prompt_list)
+
         self.auto_propagate_next_check = QCheckBox("Auto Propagate Next Frame")
         self.auto_propagate_next_check.toggled.connect(self._on_auto_propagate_next_toggled)
         processing_layout.addWidget(self.auto_propagate_next_check)
@@ -983,6 +1139,16 @@ class AnnotatorMainWindow(QMainWindow):
         self.translate_prompts_check.setChecked(self.translate_prompts_on_propagation)
         self.translate_prompts_check.toggled.connect(self._on_translate_prompts_toggled)
         processing_layout.addWidget(self.translate_prompts_check)
+
+        self.use_point_prompts_for_propagation_check = QCheckBox("Use Point Prompts for Propagation")
+        self.use_point_prompts_for_propagation_check.setChecked(self.use_point_prompts_for_propagation)
+        self.use_point_prompts_for_propagation_check.setToolTip(
+            "When disabled, current-frame point prompts are ignored as tracker seed inputs."
+        )
+        self.use_point_prompts_for_propagation_check.toggled.connect(
+            self._on_use_point_prompts_for_propagation_toggled
+        )
+        processing_layout.addWidget(self.use_point_prompts_for_propagation_check)
 
         autosave_row = QHBoxLayout()
         self.autosave_check = QCheckBox("Auto-save")
@@ -1115,11 +1281,53 @@ class AnnotatorMainWindow(QMainWindow):
 
         self.mode_label = QLabel("Mode: Prompt")
         processing_layout.addWidget(self.mode_label)
+        experimental_layout.addWidget(QLabel("Experimental tracker heuristics"))
+        experimental_layout.addWidget(
+            QLabel("These settings map to SAM3 periodic re-prompting and apply to future tracker operations.")
+        )
+        experimental_form = QFormLayout()
+        self.recondition_every_nth_frame_spin = QSpinBox()
+        self.recondition_every_nth_frame_spin.setMinimum(0)
+        self.recondition_every_nth_frame_spin.setMaximum(9999)
+        self.recondition_every_nth_frame_spin.setValue(self.recondition_every_nth_frame)
+        self.recondition_every_nth_frame_spin.setToolTip("0 disables periodic re-prompting.")
+        self.recondition_every_nth_frame_spin.valueChanged.connect(self._on_experimental_settings_changed)
+        experimental_form.addRow("Re-prompt Every N Frames", self.recondition_every_nth_frame_spin)
+
+        self.recondition_high_conf_thresh_spin = QDoubleSpinBox()
+        self.recondition_high_conf_thresh_spin.setMinimum(0.0)
+        self.recondition_high_conf_thresh_spin.setMaximum(1.0)
+        self.recondition_high_conf_thresh_spin.setSingleStep(0.05)
+        self.recondition_high_conf_thresh_spin.setDecimals(2)
+        self.recondition_high_conf_thresh_spin.setValue(self.recondition_high_conf_thresh)
+        self.recondition_high_conf_thresh_spin.valueChanged.connect(self._on_experimental_settings_changed)
+        experimental_form.addRow("High Confidence Threshold", self.recondition_high_conf_thresh_spin)
+
+        self.recondition_high_iou_thresh_spin = QDoubleSpinBox()
+        self.recondition_high_iou_thresh_spin.setMinimum(0.0)
+        self.recondition_high_iou_thresh_spin.setMaximum(1.0)
+        self.recondition_high_iou_thresh_spin.setSingleStep(0.05)
+        self.recondition_high_iou_thresh_spin.setDecimals(2)
+        self.recondition_high_iou_thresh_spin.setValue(self.recondition_high_iou_thresh)
+        self.recondition_high_iou_thresh_spin.valueChanged.connect(self._on_experimental_settings_changed)
+        experimental_form.addRow("High IoU Threshold", self.recondition_high_iou_thresh_spin)
+        self.use_one_session_chunked_propagation_check = QCheckBox("Use One Session for Chunked Propagation")
+        self.use_one_session_chunked_propagation_check.setChecked(self.use_one_session_chunked_propagation)
+        self.use_one_session_chunked_propagation_check.setToolTip(
+            "Keep tracker propagation chunked in the UI, but reuse one full-video SAM3 session across chunks."
+        )
+        self.use_one_session_chunked_propagation_check.toggled.connect(
+            self._on_use_one_session_chunked_propagation_toggled
+        )
+        experimental_layout.addWidget(self.use_one_session_chunked_propagation_check)
+        experimental_layout.addLayout(experimental_form)
         prompt_layout.addStretch(1)
         processing_layout.addStretch(1)
+        experimental_layout.addStretch(1)
 
         control_tabs.addTab(prompt_tab, "Prompting")
         control_tabs.addTab(processing_tab, "Segment / Propagate")
+        control_tabs.addTab(experimental_tab, "Experimental Features")
 
         self._advanced_widgets = [
             self.prompt_mode_label,
@@ -1149,6 +1357,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._setup_shortcuts()
         self._install_focus_return_on_widget(self.checkpoint_combo)
         self._install_focus_return_on_widget(self.frame_jump_spin)
+        self._install_focus_return_on_widget(self.text_prompt_input)
         self._install_focus_return_on_widget(self.autosave_minutes_spin)
         self._install_focus_return_on_widget(self.segmentation_opacity_spin)
         self._install_focus_return_on_widget(self.box_line_thickness_spin)
@@ -1156,6 +1365,10 @@ class AnnotatorMainWindow(QMainWindow):
         self._install_focus_return_on_widget(self.chunks_spin)
         self._install_focus_return_on_widget(self.target_frame_spin)
         self._install_focus_return_on_widget(self.propagation_mode_combo)
+        self._install_focus_return_on_widget(self.recondition_every_nth_frame_spin)
+        self._install_focus_return_on_widget(self.recondition_high_conf_thresh_spin)
+        self._install_focus_return_on_widget(self.recondition_high_iou_thresh_spin)
+        self._install_focus_return_on_widget(self.use_one_session_chunked_propagation_check)
         self._sync_propagation_mode_controls()
         self._status_label = QLabel("Load a frame directory to start")
         self._status_progress = QProgressBar()
@@ -1190,6 +1403,58 @@ class AnnotatorMainWindow(QMainWindow):
 
     def _on_translate_prompts_toggled(self, checked: bool) -> None:
         self.translate_prompts_on_propagation = checked
+
+    def _on_use_point_prompts_for_propagation_toggled(self, checked: bool) -> None:
+        self.use_point_prompts_for_propagation = checked
+
+    def _on_use_one_session_chunked_propagation_toggled(self, checked: bool) -> None:
+        self.use_one_session_chunked_propagation = checked
+        if not checked:
+            self._one_session_chunk_prompt_version = None
+
+    def _on_experimental_settings_changed(self, _value) -> None:
+        if hasattr(self, "recondition_every_nth_frame_spin"):
+            self.recondition_every_nth_frame = int(self.recondition_every_nth_frame_spin.value())
+        if hasattr(self, "recondition_high_conf_thresh_spin"):
+            self.recondition_high_conf_thresh = float(self.recondition_high_conf_thresh_spin.value())
+        if hasattr(self, "recondition_high_iou_thresh_spin"):
+            self.recondition_high_iou_thresh = float(self.recondition_high_iou_thresh_spin.value())
+        self._apply_experimental_settings_live()
+
+    def _apply_experimental_settings_live(self) -> None:
+        if self._sam_worker is None or not self._sam_ready:
+            return
+        task_id = self._enqueue_sam_task(
+            "update_experimental_settings",
+            {
+                "recondition_every_nth_frame": self.recondition_every_nth_frame,
+                "recondition_high_conf_thresh": self.recondition_high_conf_thresh,
+                "recondition_high_iou_thresh": self.recondition_high_iou_thresh,
+            },
+            priority=True,
+        )
+        self._sam_task_contexts[task_id] = {"kind": "update_experimental_settings"}
+        self._wait_for_sam_task(task_id)
+
+    def _sync_experimental_controls(self) -> None:
+        if hasattr(self, "recondition_every_nth_frame_spin"):
+            self.recondition_every_nth_frame_spin.blockSignals(True)
+            self.recondition_every_nth_frame_spin.setValue(int(self.recondition_every_nth_frame))
+            self.recondition_every_nth_frame_spin.blockSignals(False)
+        if hasattr(self, "recondition_high_conf_thresh_spin"):
+            self.recondition_high_conf_thresh_spin.blockSignals(True)
+            self.recondition_high_conf_thresh_spin.setValue(float(self.recondition_high_conf_thresh))
+            self.recondition_high_conf_thresh_spin.blockSignals(False)
+        if hasattr(self, "recondition_high_iou_thresh_spin"):
+            self.recondition_high_iou_thresh_spin.blockSignals(True)
+            self.recondition_high_iou_thresh_spin.setValue(float(self.recondition_high_iou_thresh))
+            self.recondition_high_iou_thresh_spin.blockSignals(False)
+        if hasattr(self, "use_one_session_chunked_propagation_check"):
+            self.use_one_session_chunked_propagation_check.blockSignals(True)
+            self.use_one_session_chunked_propagation_check.setChecked(
+                bool(self.use_one_session_chunked_propagation)
+            )
+            self.use_one_session_chunked_propagation_check.blockSignals(False)
 
     def _on_propagation_target_toggled(self, checked: bool) -> None:
         self.use_target_frame = checked
@@ -1545,8 +1810,8 @@ class AnnotatorMainWindow(QMainWindow):
                 label.setText(self._object_display_text(obj_id))
             propagate_check = row.get("propagate_check")
             if isinstance(propagate_check, QCheckBox):
-                has_current_prompt = self._object_has_current_frame_prompt(obj_id)
-                checked = propagate_check.isChecked() and has_current_prompt
+                has_current_prompt = self._object_has_current_frame_seed(obj_id)
+                checked = self._is_object_enabled_for_current_frame_propagation(obj_id)
                 propagate_check.blockSignals(True)
                 propagate_check.setChecked(checked)
                 propagate_check.setEnabled(self.object_list.isEnabled() and has_current_prompt)
@@ -1604,11 +1869,25 @@ class AnnotatorMainWindow(QMainWindow):
     def _object_display_text(self, obj_id: int) -> str:
         obj = self._find_object(obj_id)
         base = f"{obj.name} (id={obj_id})" if obj else str(obj_id)
+        tracker_score = self._get_current_frame_tracker_score(obj_id)
+        if tracker_score is not None:
+            base += f" [trk={tracker_score:.2f}]"
         if self.solo_object_id == obj_id:
             base += " [solo]"
         elif obj_id in self.hidden_obj_ids:
             base += " [hidden]"
         return base
+
+    def _get_current_frame_tracker_score(self, obj_id: int) -> Optional[float]:
+        output = self.outputs_by_frame.get(self.current_frame_idx)
+        if output is None:
+            return None
+        if obj_id not in output.obj_ids:
+            return None
+        idx = output.obj_ids.index(obj_id)
+        if idx >= len(output.tracker_scores):
+            return None
+        return float(output.tracker_scores[idx])
 
     def _create_object_row_widget(self, obj_id: int) -> QWidget:
         row_widget = QWidget()
@@ -1618,7 +1897,7 @@ class AnnotatorMainWindow(QMainWindow):
 
         propagate_check = QCheckBox("Prop")
         propagate_check.setChecked(True)
-        propagate_check.toggled.connect(lambda _checked, oid=obj_id: self._set_active_object_by_id(oid))
+        propagate_check.toggled.connect(lambda checked, oid=obj_id: self._on_object_propagate_toggled(oid, checked))
         layout.addWidget(propagate_check)
 
         label = QLabel(self._object_display_text(obj_id))
@@ -1660,12 +1939,49 @@ class AnnotatorMainWindow(QMainWindow):
             return obj_id == self.solo_object_id
         return obj_id not in self.hidden_obj_ids
 
-    def _object_has_current_frame_prompt(self, obj_id: int) -> bool:
+    def _object_has_current_frame_seed(self, obj_id: int) -> bool:
         frame_prompts = self.prompts_by_frame_obj.get(self.current_frame_idx, {})
         if frame_prompts.get(obj_id):
             return True
         frame_boxes = self.box_prompts_by_frame_obj.get(self.current_frame_idx, {})
-        return obj_id in frame_boxes
+        if obj_id in frame_boxes:
+            return True
+        output = self.outputs_by_frame.get(self.current_frame_idx)
+        return output is not None and obj_id in output.obj_ids
+
+    def _set_manual_propagation_override(
+        self,
+        frame_idx: int,
+        obj_id: int,
+        enabled: Optional[bool],
+    ) -> None:
+        if enabled is None:
+            per_obj = self.manual_propagation_overrides_by_frame_obj.get(frame_idx)
+            if per_obj is None:
+                return
+            per_obj.pop(obj_id, None)
+            if not per_obj:
+                self.manual_propagation_overrides_by_frame_obj.pop(frame_idx, None)
+            return
+        self.manual_propagation_overrides_by_frame_obj.setdefault(frame_idx, {})[obj_id] = bool(enabled)
+
+    def _is_object_enabled_for_current_frame_propagation(self, obj_id: int) -> bool:
+        if not self._object_has_current_frame_seed(obj_id):
+            return False
+        override = self.manual_propagation_overrides_by_frame_obj.get(self.current_frame_idx, {}).get(obj_id)
+        if override is None:
+            return True
+        return bool(override)
+
+    def _on_object_propagate_toggled(self, obj_id: int, checked: bool) -> None:
+        self._set_active_object_by_id(obj_id)
+        if not self._object_has_current_frame_seed(obj_id):
+            self._set_manual_propagation_override(self.current_frame_idx, obj_id, None)
+            return
+        if checked:
+            self._set_manual_propagation_override(self.current_frame_idx, obj_id, None)
+        else:
+            self._set_manual_propagation_override(self.current_frame_idx, obj_id, False)
 
     def _set_active_object_by_id(self, obj_id: int) -> None:
         for i in range(self.object_list.count()):
@@ -1771,6 +2087,8 @@ class AnnotatorMainWindow(QMainWindow):
                 self.propagation_mode_combo.blockSignals(False)
         if hasattr(self, "translate_prompts_check"):
             self.translate_prompts_check.setEnabled(self._is_tracker_propagation_mode())
+        if hasattr(self, "use_point_prompts_for_propagation_check"):
+            self.use_point_prompts_for_propagation_check.setEnabled(self._is_tracker_propagation_mode())
 
     def _note_prompt_change_and_prefetch(self) -> None:
         if self.active_object_id is not None:
@@ -1907,6 +2225,11 @@ class AnnotatorMainWindow(QMainWindow):
         self.add_obj_btn.setEnabled(enabled)
         self.remove_obj_btn.setEnabled(enabled)
         self.object_list.setEnabled(enabled)
+        self.text_prompt_input.setEnabled(enabled)
+        self.generate_text_prompt_btn.setEnabled(enabled)
+        self.accept_text_prompt_btn.setEnabled(enabled)
+        self.clear_text_prompt_btn.setEnabled(enabled)
+        self.text_prompt_list.setEnabled(enabled)
         for row in self._object_row_widgets.values():
             propagate_check = row.get("propagate_check")
             rename_btn = row.get("rename_btn")
@@ -1931,6 +2254,10 @@ class AnnotatorMainWindow(QMainWindow):
         self.autosave_check.setEnabled(enabled)
         self.autosave_minutes_spin.setEnabled(enabled)
         self.propagation_mode_combo.setEnabled(enabled)
+        self.recondition_every_nth_frame_spin.setEnabled(enabled)
+        self.recondition_high_conf_thresh_spin.setEnabled(enabled)
+        self.recondition_high_iou_thresh_spin.setEnabled(enabled)
+        self.use_one_session_chunked_propagation_check.setEnabled(enabled)
         running = self._propagation_busy
         pending = self._pending_propagation is not None
         self.stop_propagate_btn.setEnabled(running or pending)
@@ -1938,6 +2265,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.target_frame_spin.setEnabled(enabled and self.use_target_frame_check.isChecked())
         self.chunks_spin.setEnabled(enabled and not self.use_target_frame_check.isChecked())
         self.translate_prompts_check.setEnabled(enabled and self._is_tracker_propagation_mode())
+        self.use_point_prompts_for_propagation_check.setEnabled(enabled and self._is_tracker_propagation_mode())
         self._sync_current_box_lock_check()
 
     def _sync_current_box_lock_check(self) -> None:
@@ -1991,6 +2319,8 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_prompts_by_frame_obj.clear()
         self.box_locked_by_frame_obj.clear()
         self.outputs_by_frame.clear()
+        self.manual_propagation_overrides_by_frame_obj.clear()
+        self._clear_text_prompt_proposals_if_needed()
         self._output_version_by_frame.clear()
         self._prefetch_provenance_by_frame.clear()
         self._undo_state = None
@@ -2041,7 +2371,9 @@ class AnnotatorMainWindow(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Invalid name", "Object name cannot be empty.")
             return
+        self._create_object_entry(name)
 
+    def _create_object_entry(self, name: str) -> ObjectInfo:
         obj_id = self.next_obj_id
         self.next_obj_id += 1
         color = self._color_for_obj(obj_id)
@@ -2054,6 +2386,136 @@ class AnnotatorMainWindow(QMainWindow):
         self.object_list.setItemWidget(item, self._create_object_row_widget(obj.obj_id))
         self.object_list.setCurrentItem(item)
         self._refresh_object_list_visuals()
+        return obj
+
+    def generate_objects_from_text_prompt(self) -> None:
+        if not self.frame_paths:
+            QMessageBox.information(self, "No frames loaded", "Load a frame directory first.")
+            return
+        text_prompt = self.text_prompt_input.text().strip()
+        if not text_prompt:
+            QMessageBox.information(self, "No text prompt", "Enter a text prompt first.")
+            return
+        if self._prefetch_busy:
+            self._cancel_prefetch(restart=False)
+        if not self._ensure_sam_initialized():
+            return
+        task_id = self._enqueue_sam_task(
+            "text_prompt",
+            {
+                "frame_idx": self.current_frame_idx,
+                "frame_path": self.frame_paths[self.current_frame_idx],
+                "text_prompt": text_prompt,
+            },
+        )
+        self._sam_task_contexts[task_id] = {"kind": "text_prompt"}
+        self._set_status("Generating text prompt proposals...", progress=0, total=1)
+        self._wait_for_sam_task(task_id)
+
+    def accept_selected_text_prompt_proposals(self) -> None:
+        if self._text_prompt_proposals_frame_idx != self.current_frame_idx or not self._text_prompt_proposals:
+            QMessageBox.information(self, "No proposals", "Generate text prompt proposals on this frame first.")
+            return
+        selected_indices = self._selected_text_prompt_proposal_indices()
+        if not selected_indices:
+            QMessageBox.information(self, "No proposals selected", "Check at least one proposal to accept.")
+            return
+        frame_size = self._get_current_frame_size()
+        if frame_size is None:
+            QMessageBox.warning(self, "Missing frame size", "Could not determine the current frame size.")
+            return
+        existing_output = self.outputs_by_frame.get(
+            self.current_frame_idx,
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
+        )
+        accepted_obj_ids: List[int] = []
+        prompt_label = self._text_prompt_last_prompt or self.text_prompt_input.text().strip() or "Object"
+        for proposal_idx in selected_indices:
+            if proposal_idx < 0 or proposal_idx >= len(self._text_prompt_proposals):
+                continue
+            proposal = self._text_prompt_proposals[proposal_idx]
+            obj_name = next_prompt_object_name(prompt_label, (obj.name for obj in self.objects))
+            obj = self._create_object_entry(obj_name)
+            accepted_obj_ids.append(obj.obj_id)
+            self._commit_text_prompt_proposal(obj.obj_id, proposal, frame_size, existing_output)
+            existing_output = self.outputs_by_frame.get(self.current_frame_idx, existing_output)
+        if not accepted_obj_ids:
+            QMessageBox.information(self, "No proposals accepted", "No valid proposals were accepted.")
+            return
+        self._note_prompt_change_and_prefetch()
+        self._set_status(f"Accepted {len(accepted_obj_ids)} text prompt object(s).", progress=1, total=1)
+        self.clear_text_prompt_proposals()
+        self._render_current_frame()
+
+    def clear_text_prompt_proposals(self) -> None:
+        self._text_prompt_proposals_frame_idx = None
+        self._text_prompt_last_prompt = ""
+        self._text_prompt_proposals = []
+        if hasattr(self, "text_prompt_list"):
+            self.text_prompt_list.clear()
+        self._render_current_frame()
+
+    def _clear_text_prompt_proposals_if_needed(self, frame_idx: Optional[int] = None) -> None:
+        if not self._text_prompt_proposals:
+            return
+        if frame_idx is None or self._text_prompt_proposals_frame_idx != frame_idx:
+            self._text_prompt_proposals_frame_idx = None
+            self._text_prompt_last_prompt = ""
+            self._text_prompt_proposals = []
+            if hasattr(self, "text_prompt_list"):
+                self.text_prompt_list.clear()
+
+    def _selected_text_prompt_proposal_indices(self) -> List[int]:
+        selected: List[int] = []
+        for idx in range(self.text_prompt_list.count()):
+            item = self.text_prompt_list.item(idx)
+            if item is None:
+                continue
+            if item.checkState() == Qt.Checked:
+                selected.append(idx)
+        return selected
+
+    def _refresh_text_prompt_list(self) -> None:
+        if not hasattr(self, "text_prompt_list"):
+            return
+        self.text_prompt_list.clear()
+        for proposal in self._text_prompt_proposals:
+            x1, y1, x2, y2 = proposal.box_xyxy_px
+            item = QListWidgetItem(
+                f"{proposal.proposal_idx + 1}. score={proposal.score:.3f} box=({x1}, {y1}) -> ({x2}, {y2})"
+            )
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.text_prompt_list.addItem(item)
+
+    def _commit_text_prompt_proposal(
+        self,
+        obj_id: int,
+        proposal: TextPromptProposal,
+        frame_size: Tuple[int, int],
+        existing_output: SamFrameOutput,
+    ) -> None:
+        width, height = frame_size
+        x1, y1, x2, y2 = proposal.box_xyxy_px
+        frame_boxes = self.box_prompts_by_frame_obj.setdefault(self.current_frame_idx, {})
+        frame_boxes[obj_id] = BoxPrompt(x1_px=x1, y1_px=y1, x2_px=x2, y2_px=y2)
+        self._set_current_box_locked(self.current_frame_idx, obj_id, False)
+        self.prompts_by_frame_obj.setdefault(self.current_frame_idx, {}).setdefault(obj_id, [])
+        box_xywh_norm = (
+            float(x1) / width,
+            float(y1) / height,
+            float(max(0, x2 - x1)) / width,
+            float(max(0, y2 - y1)) / height,
+        )
+        proposal_output = SamFrameOutput(
+            obj_ids=[obj_id],
+            masks=[np.asarray(proposal.mask).astype(bool)],
+            boxes_xywh_norm=[box_xywh_norm],
+            scores=[float(proposal.score)],
+            tracker_scores=[0.0],
+        )
+        self.outputs_by_frame[self.current_frame_idx] = self._merge_frame_outputs(existing_output, proposal_output)
+        self._output_version_by_frame[self.current_frame_idx] = self._prefetch_prompt_version
 
     def remove_active_object(self) -> None:
         if self.active_object_id is None:
@@ -2071,6 +2533,13 @@ class AnnotatorMainWindow(QMainWindow):
             frame_map.pop(obj_id, None)
         for frame_map in self.box_locked_by_frame_obj.values():
             frame_map.pop(obj_id, None)
+        for frame_map in self.manual_propagation_overrides_by_frame_obj.values():
+            frame_map.pop(obj_id, None)
+        self.manual_propagation_overrides_by_frame_obj = {
+            frame_idx: frame_map
+            for frame_idx, frame_map in self.manual_propagation_overrides_by_frame_obj.items()
+            if frame_map
+        }
 
         for frame_idx, out in list(self.outputs_by_frame.items()):
             keep_idx = [i for i, oid in enumerate(out.obj_ids) if oid != obj_id]
@@ -2081,6 +2550,7 @@ class AnnotatorMainWindow(QMainWindow):
                 masks=[out.masks[i] for i in keep_idx],
                 boxes_xywh_norm=[out.boxes_xywh_norm[i] for i in keep_idx],
                 scores=[out.scores[i] for i in keep_idx],
+                tracker_scores=[out.tracker_scores[i] for i in keep_idx],
             )
 
         for i in range(self.object_list.count()):
@@ -2200,6 +2670,7 @@ class AnnotatorMainWindow(QMainWindow):
         if not self.frame_paths:
             return
         self.current_frame_idx = max(0, min(len(self.frame_paths) - 1, frame_idx))
+        self._clear_text_prompt_proposals_if_needed(self.current_frame_idx)
         self._sync_frame_navigation_controls()
         self._render_current_frame()
 
@@ -2490,11 +2961,18 @@ class AnnotatorMainWindow(QMainWindow):
             return True
         if self._sam_worker is not None and not self._sam_ready:
             return False
-        worker = SamWorker(self._checkpoint_path, self._bpe_path)
+        worker = SamWorker(
+            self._checkpoint_path,
+            self._bpe_path,
+            self.recondition_every_nth_frame,
+            self.recondition_high_conf_thresh,
+            self.recondition_high_iou_thresh,
+        )
         thread = QThread()
         worker.moveToThread(thread)
         worker.initialized.connect(self._on_sam_worker_initialized)
         worker.segment_done.connect(self._on_sam_segment_done)
+        worker.text_prompt_done.connect(self._on_sam_text_prompt_done)
         worker.propagate_frame.connect(self._on_sam_propagate_frame)
         worker.propagate_done.connect(self._on_sam_propagate_done)
         worker.propagate_stopped.connect(self._on_sam_propagate_stopped)
@@ -2627,6 +3105,7 @@ class AnnotatorMainWindow(QMainWindow):
             )
             self._propagation_enabled_obj_ids = enabled_obj_ids
             self._propagation_view_frame_idx = self.current_frame_idx
+            self._one_session_chunk_prompt_version = self._prefetch_prompt_version if self.use_one_session_chunked_propagation else None
         state = self._pending_propagation
         if state is None:
             return
@@ -2664,7 +3143,7 @@ class AnnotatorMainWindow(QMainWindow):
             canonical_box = frame_boxes.get(obj_id)
             if canonical_box is not None:
                 boxes_to_apply[obj_id] = canonical_box
-            manual_points = list(frame_prompts.get(obj_id, []))
+            manual_points = list(frame_prompts.get(obj_id, [])) if self.use_point_prompts_for_propagation else []
             if manual_points:
                 points_to_apply[obj_id] = manual_points
         seed_output = self.outputs_by_frame.get(seed_frame_idx)
@@ -2906,6 +3385,10 @@ class AnnotatorMainWindow(QMainWindow):
             progress=state.completed_chunks,
             total=state.total_chunks,
         )
+        use_one_session = self.use_one_session_chunked_propagation
+        rebuild_one_session = bool(use_one_session and state.completed_chunks == 0)
+        if use_one_session and self._one_session_chunk_prompt_version != self._prefetch_prompt_version:
+            rebuild_one_session = True
 
         task_id = self._enqueue_sam_task(
             "propagate",
@@ -2914,19 +3397,22 @@ class AnnotatorMainWindow(QMainWindow):
                 "n_frames": state.n_frames,
                 "frame_paths": self.frame_paths,
                 "prompt_payload": prompt_payload,
+                "use_one_session": use_one_session,
+                "rebuild_one_session": rebuild_one_session,
             },
         )
         self._sam_task_contexts[task_id] = {
             "kind": "manual",
             "seed_frame_idx": seed_frame_idx,
             "last_emitted_frame_idx": seed_frame_idx - 1,
+            "use_one_session": use_one_session,
         }
         self._propagation_task_id = task_id
 
     def _handle_propagation_frame(self, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
         existing_output = self.outputs_by_frame.get(
             abs_frame_idx,
-            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
         )
         merged_output = self._merge_frame_outputs(existing_output, output)
         self.outputs_by_frame[abs_frame_idx] = merged_output
@@ -2950,7 +3436,7 @@ class AnnotatorMainWindow(QMainWindow):
     def _on_sam_segment_done(self, task_id: str, frame_idx: int, composite: SamFrameOutput) -> None:
         existing_output = self.outputs_by_frame.get(
             frame_idx,
-            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
         )
         merged = self._merge_frame_outputs(existing_output, composite)
         if composite.obj_ids:
@@ -2969,6 +3455,38 @@ class AnnotatorMainWindow(QMainWindow):
         self._sam_task_contexts.pop(task_id, None)
         self._schedule_prefetch_for_next_frame()
 
+    def _on_sam_text_prompt_done(
+        self,
+        task_id: str,
+        frame_idx: int,
+        composite: SamFrameOutput,
+        text_prompt: str,
+    ) -> None:
+        frame_size = self._get_frame_size(frame_idx)
+        proposals: List[TextPromptProposal] = []
+        if frame_size is not None:
+            proposals = build_text_prompt_proposals(
+                masks=composite.masks,
+                boxes_xywh_norm=composite.boxes_xywh_norm,
+                scores=composite.scores,
+                frame_size=frame_size,
+            )
+        self._text_prompt_proposals_frame_idx = frame_idx
+        self._text_prompt_last_prompt = text_prompt
+        self._text_prompt_proposals = proposals
+        self._refresh_text_prompt_list()
+        self._render_current_frame()
+        self._sam_task_results[task_id] = proposals
+        loop = self._sam_waiting.get(task_id)
+        if loop is not None:
+            loop.quit()
+        self._sam_task_contexts.pop(task_id, None)
+        if proposals:
+            self._set_status(f"Generated {len(proposals)} text prompt proposal(s).", progress=1, total=1)
+        else:
+            QMessageBox.information(self, "No proposals", f"No objects found for '{text_prompt}' on this frame.")
+            self._set_status("No text prompt proposals generated.", progress=1, total=1)
+
     def _on_sam_propagate_frame(self, task_id: str, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
         context = self._sam_task_contexts.get(task_id, {})
         kind = context.get("kind")
@@ -2982,7 +3500,7 @@ class AnnotatorMainWindow(QMainWindow):
                 return
             existing_output = self.outputs_by_frame.get(
                 abs_frame_idx,
-                SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+                SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
             )
             merged_output = self._merge_frame_outputs(existing_output, output)
             self.outputs_by_frame[abs_frame_idx] = merged_output
@@ -3012,7 +3530,7 @@ class AnnotatorMainWindow(QMainWindow):
 
         existing_output = self.outputs_by_frame.get(
             abs_frame_idx,
-            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
         )
         merged_output = self._merge_frame_outputs(existing_output, output)
         self.outputs_by_frame[abs_frame_idx] = merged_output
@@ -3155,10 +3673,17 @@ class AnnotatorMainWindow(QMainWindow):
             self._prefetch_cached_version = None
             self._sam_task_contexts.pop(task_id, None)
             return
+        title = "SAM3 task failed"
+        if kind in {"manual", "auto"}:
+            title = "Propagation failed"
+        elif kind == "text_prompt":
+            title = "Text prompt generation failed"
+        elif kind == "update_experimental_settings":
+            title = "Experimental settings update failed"
         if is_warning:
-            QMessageBox.warning(self, "Propagation stopped", message)
+            QMessageBox.warning(self, title, message)
         else:
-            QMessageBox.critical(self, "Propagation failed", message)
+            QMessageBox.critical(self, title, message)
         if kind in {"manual", "auto"}:
             self._propagation_busy = False
             self._set_propagation_ui_enabled(True)
@@ -3186,7 +3711,7 @@ class AnnotatorMainWindow(QMainWindow):
             return
         existing_output = self.outputs_by_frame.get(
             abs_frame_idx,
-            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[]),
+            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
         )
         merged_output = self._merge_frame_outputs(existing_output, output)
         self.outputs_by_frame[abs_frame_idx] = merged_output
@@ -3363,6 +3888,7 @@ class AnnotatorMainWindow(QMainWindow):
             masks=[np.asarray(mask).copy() for mask in output.masks],
             boxes_xywh_norm=[tuple(b) for b in output.boxes_xywh_norm],
             scores=list(output.scores),
+            tracker_scores=list(output.tracker_scores),
         )
 
     def _stash_undo_state(self) -> None:
@@ -3471,6 +3997,7 @@ class AnnotatorMainWindow(QMainWindow):
             masks=[output.masks[i] for i in keep_idx],
             boxes_xywh_norm=[output.boxes_xywh_norm[i] for i in keep_idx],
             scores=[output.scores[i] for i in keep_idx],
+            tracker_scores=[output.tracker_scores[i] for i in keep_idx],
         )
 
     def _remove_object_annotations_from_frame(self, frame_idx: int, obj_id: Optional[int]) -> None:
@@ -3501,6 +4028,7 @@ class AnnotatorMainWindow(QMainWindow):
             masks=list(base_output.masks),
             boxes_xywh_norm=list(base_output.boxes_xywh_norm),
             scores=list(base_output.scores),
+            tracker_scores=list(base_output.tracker_scores),
         )
         obj_to_idx = {obj_id: i for i, obj_id in enumerate(merged.obj_ids)}
 
@@ -3508,16 +4036,19 @@ class AnnotatorMainWindow(QMainWindow):
             if i >= len(new_output.masks) or i >= len(new_output.boxes_xywh_norm):
                 continue
             score = new_output.scores[i] if i < len(new_output.scores) else 0.0
+            tracker_score = new_output.tracker_scores[i] if i < len(new_output.tracker_scores) else 0.0
             if obj_id in obj_to_idx:
                 idx = obj_to_idx[obj_id]
                 merged.masks[idx] = new_output.masks[i]
                 merged.boxes_xywh_norm[idx] = new_output.boxes_xywh_norm[i]
                 merged.scores[idx] = score
+                merged.tracker_scores[idx] = tracker_score
             else:
                 merged.obj_ids.append(obj_id)
                 merged.masks.append(new_output.masks[i])
                 merged.boxes_xywh_norm.append(new_output.boxes_xywh_norm[i])
                 merged.scores.append(score)
+                merged.tracker_scores.append(tracker_score)
                 obj_to_idx[obj_id] = len(merged.obj_ids) - 1
 
         return merged
@@ -3629,9 +4160,8 @@ class AnnotatorMainWindow(QMainWindow):
 
     def _get_enabled_propagation_obj_ids_from_rows(self) -> set[int]:
         enabled: set[int] = set()
-        for obj_id, row in self._object_row_widgets.items():
-            propagate_check = row.get("propagate_check")
-            if isinstance(propagate_check, QCheckBox) and propagate_check.isChecked():
+        for obj_id in self._object_row_widgets.keys():
+            if self._is_object_enabled_for_current_frame_propagation(int(obj_id)):
                 enabled.add(int(obj_id))
         return enabled
 
@@ -3777,6 +4307,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._propagation_active_chunk_idx = None
         self._propagation_active_seed_frame_idx = None
         self._propagation_task_id = None
+        self._one_session_chunk_prompt_version = None
         self._propagation_stop_requested = False
         self._propagation_seen_obj_ids.clear()
         self._propagation_lost_obj_ids.clear()
@@ -3888,7 +4419,7 @@ class AnnotatorMainWindow(QMainWindow):
         frame_files = [p.name for p in self.frame_paths]
 
         data = {
-            "version": 2,
+            "version": 6,
             "frame_dir": str(self.image_dir),
             "frame_files": frame_files,
             "current_frame_idx": int(self.current_frame_idx),
@@ -3910,6 +4441,7 @@ class AnnotatorMainWindow(QMainWindow):
             "prompts": {},
             "boxes": {},
             "box_locks": {},
+            "propagation_overrides": {},
             "outputs": {},
             "view": {
                 "show_prompts": self.show_prompts,
@@ -3926,7 +4458,14 @@ class AnnotatorMainWindow(QMainWindow):
                 "use_target_frame": bool(self.use_target_frame_check.isChecked()),
                 "target_frame_idx": int(self.target_frame_spin.value() - 1),
                 "translate_prompts": bool(self.translate_prompts_on_propagation),
+                "use_point_prompts": bool(self.use_point_prompts_for_propagation),
                 "auto_propagate_next": bool(self.auto_propagate_next),
+            },
+            "experimental": {
+                "recondition_every_nth_frame": int(self.recondition_every_nth_frame),
+                "recondition_high_conf_thresh": float(self.recondition_high_conf_thresh),
+                "recondition_high_iou_thresh": float(self.recondition_high_iou_thresh),
+                "use_one_session_chunked_propagation": bool(self.use_one_session_chunked_propagation),
             },
             "prompt_mode_index": int(self.prompt_mode_combo.currentIndex()),
         }
@@ -3949,6 +4488,14 @@ class AnnotatorMainWindow(QMainWindow):
                     "y2_px": box.y2_px,
                 }
 
+        for frame_idx, per_obj in self.manual_propagation_overrides_by_frame_obj.items():
+            if not per_obj:
+                continue
+            data["propagation_overrides"][str(frame_idx)] = {
+                str(obj_id): bool(enabled)
+                for obj_id, enabled in per_obj.items()
+            }
+
         for frame_idx, per_obj in self.box_locked_by_frame_obj.items():
             data["box_locks"][str(frame_idx)] = {
                 str(obj_id): bool(locked) for obj_id, locked in per_obj.items()
@@ -3959,6 +4506,7 @@ class AnnotatorMainWindow(QMainWindow):
                 "obj_ids": [int(x) for x in output.obj_ids],
                 "boxes_xywh_norm": [list(map(float, b)) for b in output.boxes_xywh_norm],
                 "scores": [float(s) for s in output.scores],
+                "tracker_scores": [float(s) for s in output.tracker_scores],
                 "mask_paths": [],
             }
             for obj_id, mask in zip(output.obj_ids, output.masks):
@@ -4024,6 +4572,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._selected_box_obj_id = None
         self.flagged_frame_indices.clear()
         self._box_rubber_band.hide()
+        self._clear_text_prompt_proposals_if_needed()
         self._reset_prefetch_state()
 
         existing_names = {p.name for p in frame_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS}
@@ -4041,8 +4590,32 @@ class AnnotatorMainWindow(QMainWindow):
             self.checkpoint_combo.setCurrentText(self._checkpoint_path)
         else:
             self.checkpoint_combo.setCurrentIndex(0)
+        experimental = data.get("experimental", {})
+        self.recondition_every_nth_frame = int(
+            experimental.get(
+                "recondition_every_nth_frame",
+                DEFAULT_RECONDITION_EVERY_NTH_FRAME,
+            )
+        )
+        self.recondition_high_conf_thresh = float(
+            experimental.get(
+                "recondition_high_conf_thresh",
+                DEFAULT_RECONDITION_HIGH_CONF_THRESH,
+            )
+        )
+        self.recondition_high_iou_thresh = float(
+            experimental.get(
+                "recondition_high_iou_thresh",
+                DEFAULT_RECONDITION_HIGH_IOU_THRESH,
+            )
+        )
+        self.use_one_session_chunked_propagation = bool(
+            experimental.get("use_one_session_chunked_propagation", False)
+        )
+        self._sync_experimental_controls()
         update_progress(20, "Initializing SAM worker...")
         self._initialize_sam_worker(show_errors=False)
+        self._apply_experimental_settings_live()
 
         update_progress(28, "Restoring objects...")
         self.objects.clear()
@@ -4113,6 +4686,14 @@ class AnnotatorMainWindow(QMainWindow):
                 int(obj_id): bool(locked) for obj_id, locked in per_obj.items()
             }
 
+        self.manual_propagation_overrides_by_frame_obj.clear()
+        for frame_idx, per_obj in data.get("propagation_overrides", {}).items():
+            overrides = {
+                int(obj_id): bool(enabled) for obj_id, enabled in per_obj.items()
+            }
+            if overrides:
+                self.manual_propagation_overrides_by_frame_obj[int(frame_idx)] = overrides
+
         update_progress(60, "Restoring masks and outputs...")
         self.outputs_by_frame.clear()
         outputs_items = list(data.get("outputs", {}).items())
@@ -4122,6 +4703,9 @@ class AnnotatorMainWindow(QMainWindow):
             obj_ids = [int(x) for x in entry.get("obj_ids", [])]
             boxes = [tuple(map(float, b)) for b in entry.get("boxes_xywh_norm", [])]
             scores = [float(s) for s in entry.get("scores", [])]
+            tracker_scores = [float(s) for s in entry.get("tracker_scores", [])]
+            if len(tracker_scores) < len(obj_ids):
+                tracker_scores.extend([0.0] * (len(obj_ids) - len(tracker_scores)))
             mask_paths = entry.get("mask_paths", [])
             masks: List[np.ndarray] = []
             frame_size = self._get_frame_size(frame_idx_int)
@@ -4140,6 +4724,7 @@ class AnnotatorMainWindow(QMainWindow):
                 masks=masks,
                 boxes_xywh_norm=boxes,
                 scores=scores,
+                tracker_scores=tracker_scores,
             )
             self._output_version_by_frame[frame_idx_int] = self._prefetch_prompt_version
             update_progress(60 + int(20 * output_idx / total_outputs), f"Restoring masks and outputs... {output_idx}/{total_outputs}")
@@ -4171,6 +4756,8 @@ class AnnotatorMainWindow(QMainWindow):
         target_idx = int(propagation.get("target_frame_idx", self.current_frame_idx))
         self.translate_prompts_on_propagation = bool(propagation.get("translate_prompts", True))
         self.translate_prompts_check.setChecked(self.translate_prompts_on_propagation)
+        self.use_point_prompts_for_propagation = bool(propagation.get("use_point_prompts", True))
+        self.use_point_prompts_for_propagation_check.setChecked(self.use_point_prompts_for_propagation)
         self.propagation_mode = str(propagation.get("mode", "tracker"))
         self._sync_propagation_mode_controls()
         self.auto_propagate_next = bool(propagation.get("auto_propagate_next", False))
@@ -4225,6 +4812,7 @@ class AnnotatorMainWindow(QMainWindow):
         if self.current_frame_idx in self.outputs_by_frame:
             img = self._draw_output_overlay(img, self.outputs_by_frame[self.current_frame_idx])
 
+        img = self._draw_text_prompt_proposals_overlay(img)
         img = self._draw_points_overlay(img)
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -4286,6 +4874,34 @@ class AnnotatorMainWindow(QMainWindow):
                 blended = cv2.addWeighted(overlay, 1.0 - mask_alpha, color_img, mask_alpha, 0)
                 overlay = np.where(mask[..., None].astype(bool), blended, overlay)
 
+        return overlay
+
+    def _draw_text_prompt_proposals_overlay(self, img: np.ndarray) -> np.ndarray:
+        if self._text_prompt_proposals_frame_idx != self.current_frame_idx or not self._text_prompt_proposals:
+            return img
+        overlay = img.copy()
+        mask_alpha = 0.25
+        proposal_color = (0, 200, 255)
+        for idx, proposal in enumerate(self._text_prompt_proposals):
+            mask = np.asarray(proposal.mask).astype(np.uint8)
+            if mask.shape[:2] != img.shape[:2]:
+                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            color_img = np.zeros_like(img)
+            color_img[:] = proposal_color
+            blended = cv2.addWeighted(overlay, 1.0 - mask_alpha, color_img, mask_alpha, 0)
+            overlay = np.where(mask[..., None].astype(bool), blended, overlay)
+            x1, y1, x2, y2 = proposal.box_xyxy_px
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), proposal_color, 1)
+            cv2.putText(
+                overlay,
+                f"T{idx + 1}:{proposal.score:.2f}",
+                (x1, max(20, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                proposal_color,
+                1,
+                cv2.LINE_AA,
+            )
         return overlay
 
     def _draw_points_overlay(self, img: np.ndarray) -> np.ndarray:

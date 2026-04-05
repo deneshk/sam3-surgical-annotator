@@ -514,6 +514,7 @@ class Sam3VideoInference(Sam3VideoBase):
         outputs = {
             "out_obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
+            "out_tracker_probs": out_tracker_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
             "frame_stats": out.get("frame_stats", None),

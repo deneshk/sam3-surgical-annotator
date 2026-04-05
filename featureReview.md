@@ -1,17 +1,10 @@
 # For Implementation
 
 
-- Show progress for saving
-
-
-- Let's strip out useless code for now
-
-
-- Summary of shortcuts
+- turn off point prompt propagation
 
 # Implemented features To Test/ Review
 
-- Focus being stuck in the writing box
 
 - Be able to get focus of a box prompt by double clicking and it will autoswitch to box mode 
 - Add a way to flag specific frames to make it easy to jump to them in the timeline. 

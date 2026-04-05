@@ -70,6 +70,8 @@ class Sam3VideoBase(nn.Module):
         # The maximum number of objects (masklets) to track across all GPUs (for no limit, set it to -1)
         max_num_objects=-1,
         recondition_every_nth_frame=-1,
+        recondition_high_conf_thresh=0.8,
+        recondition_high_iou_thresh=0.8,
         # masket confirmation status (to suppress unconfirmed masklets)
         masklet_confirmation_enable=False,
         # a masklet is confirmed after being consecutively detected and matched for
@@ -125,6 +127,8 @@ class Sam3VideoBase(nn.Module):
         self.max_num_objects = max_num_objects
         self.num_obj_for_compile = num_obj_for_compile
         self.recondition_every_nth_frame = recondition_every_nth_frame
+        self.recondition_high_conf_thresh = recondition_high_conf_thresh
+        self.recondition_high_iou_thresh = recondition_high_iou_thresh
         self.masklet_confirmation_enable = masklet_confirmation_enable
         self.masklet_confirmation_consecutive_det_thresh = (
             masklet_confirmation_consecutive_det_thresh
@@ -472,7 +476,7 @@ class Sam3VideoBase(nn.Module):
                 ).squeeze(1)[0]
                 > 0
             )
-            HIGH_CONF_THRESH = 0.8
+            high_conf_thresh = self.recondition_high_conf_thresh
             reconditioned_states_idx = set()
             obj_idx = np.where(tracker_metadata["obj_ids_all_gpu"] == trk_obj_id)[
                 0
@@ -483,7 +487,7 @@ class Sam3VideoBase(nn.Module):
                     trk_obj_id in inference_state["obj_ids"]
                     # NOTE: Goal of this condition is to avoid reconditioning masks that are occluded/low qualiy.
                     # Unfortunately, these can get reconditioned anyway due to batching. We should consider removing these heuristics.
-                    and obj_score > HIGH_CONF_THRESH
+                    and obj_score > high_conf_thresh
                 ):
                     logger.debug(
                         f"Adding new mask for track {trk_obj_id} at frame {frame_idx}. Objects {inference_state['obj_ids']} are all reconditioned."
@@ -1273,11 +1277,11 @@ class Sam3VideoBase(nn.Module):
         # for each detection, which tracks it matched to (above threshold)
         det_to_matched_trk_obj_ids = {}
         trk_id_to_max_iou_high_conf_det = {}  # trk id --> exactly one detection idx
-        HIGH_CONF_THRESH = 0.8
-        HIGH_IOU_THRESH = 0.8
+        high_conf_thresh = self.recondition_high_conf_thresh
+        high_iou_thresh = self.recondition_high_iou_thresh
         det_to_max_iou_trk_idx = np.argmax(ious_np, axis=1)
-        det_is_high_conf = (det_scores_np >= HIGH_CONF_THRESH) & ~is_new_det
-        det_is_high_iou = np.max(ious_np, axis=1) >= HIGH_IOU_THRESH
+        det_is_high_conf = (det_scores_np >= high_conf_thresh) & ~is_new_det
+        det_is_high_iou = np.max(ious_np, axis=1) >= high_iou_thresh
         det_is_high_conf_and_iou = set(
             np.nonzero(det_is_high_conf & det_is_high_iou)[0]
         )

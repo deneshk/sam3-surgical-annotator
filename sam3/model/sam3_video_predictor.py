@@ -36,6 +36,9 @@ class Sam3VideoPredictor:
         video_loader_type="cv2",
         apply_temporal_disambiguation: bool = True,
         image_size: int = 1008,
+        recondition_every_nth_frame: int = 16,
+        recondition_high_conf_thresh: float = 0.8,
+        recondition_high_iou_thresh: float = 0.8,
     ):
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
@@ -50,6 +53,9 @@ class Sam3VideoPredictor:
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
                 image_size=image_size,
+                recondition_every_nth_frame=recondition_every_nth_frame,
+                recondition_high_conf_thresh=recondition_high_conf_thresh,
+                recondition_high_iou_thresh=recondition_high_iou_thresh,
             )
             .cuda()
             .eval()
