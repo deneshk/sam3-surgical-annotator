@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 import threading
@@ -17,6 +18,9 @@ from PIL import Image as PilImage
 from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, Signal, Slot, QEvent, QEventLoop, QMetaObject, Q_ARG, QTimer
 from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractSlider,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -30,6 +34,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QProgressDialog,
@@ -52,7 +57,12 @@ from tools.exporters.coco_export import SamFrameOutput as ExportSamFrameOutput
 from tools.exporters.perk_export import BoxPrompt as ExportPerkBoxPrompt
 from tools.exporters.perk_export import ObjectInfo as ExportPerkObjectInfo
 from tools.exporters.perk_export import PerkExporter
+from tools.research_experiment import ResearchExperimentTracker
 from tools.session_io import read_mask_png, read_session_json, write_mask_png, write_session_json
+from tools.smart_propagation import (
+    SmartPropagationSettings,
+    detect_smart_propagation_restart,
+)
 from tools.text_prompt_grounding import TextPromptProposal, build_text_prompt_proposals, next_prompt_object_name
 
 MAX_POINTS_PER_OBJECT = 6
@@ -64,6 +74,13 @@ CANVAS_SCREEN_MARGIN_PX = 40
 DEFAULT_RECONDITION_EVERY_NTH_FRAME = 16
 DEFAULT_RECONDITION_HIGH_CONF_THRESH = 0.8
 DEFAULT_RECONDITION_HIGH_IOU_THRESH = 0.8
+DEFAULT_SMART_PROPAGATION_REWIND_FRAMES = 3
+DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE = 50
+DEFAULT_CHECKPOINT_OPTION_LABEL = "Use default HF checkpoint"
+CHECKPOINT_PRESET_OPTIONS: List[Tuple[str, Optional[str]]] = [
+    (DEFAULT_CHECKPOINT_OPTION_LABEL, None),
+    ("sam3.1_multiplex (local)", r"C:\Users\denes\Downloads\sam3.1_multiplex.pt"),
+]
 
 
 @dataclass
@@ -105,6 +122,11 @@ class PendingPropagationState:
     total_chunks: int
     target_frame_idx: Optional[int] = None
     completed_chunks: int = 0
+    run_start_frame_idx: int = 0
+    active_chunk_n_frames: Optional[int] = None
+    pending_smart_restart_seed_frame_idx: Optional[int] = None
+    pending_smart_restart_loss_frame_idx: Optional[int] = None
+    smart_restart_cooldown_until_frame_idx: Optional[int] = None
 
 
 class PropagationWorker(QObject):
@@ -802,7 +824,7 @@ class Sam3Adapter:
 
 class AnnotatorMainWindow(QMainWindow):
     task_requested = Signal(str, str, object, bool)
-    def __init__(self):
+    def __init__(self, research_mode_enabled: bool = False):
         super().__init__()
         self.setWindowTitle("SAM3 Surgical Video Annotator")
         self._apply_window_sizing()
@@ -854,7 +876,10 @@ class AnnotatorMainWindow(QMainWindow):
         self._propagation_stop_requested: bool = False
         self._propagation_seen_obj_ids: set[int] = set()
         self._propagation_lost_obj_ids: set[int] = set()
+        self._smart_propagation_waiting_for_recovery_obj_ids: set[int] = set()
         self._propagation_loss_notified: bool = False
+        self._propagation_smart_restart_requested: bool = False
+        self._smart_propagation_triggered_loss_keys: set[tuple[int, int]] = set()
         self._sam_thread: Optional[QThread] = None
         self._sam_worker: Optional[SamWorker] = None
         self._sam_ready: bool = False
@@ -899,16 +924,36 @@ class AnnotatorMainWindow(QMainWindow):
         self.use_point_prompts_for_propagation: bool = True
         self.use_target_frame: bool = False
         self.use_one_session_chunked_propagation: bool = False
+        self.smart_propagation_enabled: bool = False
+        self.smart_propagation_rewind_frames: int = DEFAULT_SMART_PROPAGATION_REWIND_FRAMES
+        self.smart_propagation_recovery_chunk_size: int = DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE
         self.segmentation_opacity: float = 0.6
         self.box_line_thickness: int = 2
         self.recondition_every_nth_frame: int = DEFAULT_RECONDITION_EVERY_NTH_FRAME
         self.recondition_high_conf_thresh: float = DEFAULT_RECONDITION_HIGH_CONF_THRESH
         self.recondition_high_iou_thresh: float = DEFAULT_RECONDITION_HIGH_IOU_THRESH
+        self._research_mode_enabled: bool = bool(research_mode_enabled)
+        self._research_tracker: Optional[ResearchExperimentTracker] = (
+            ResearchExperimentTracker() if self._research_mode_enabled else None
+        )
+        self._research_ui_timer = QTimer(self)
+        self._research_ui_timer.setInterval(250)
+        self._research_ui_timer.timeout.connect(self._update_research_status_widgets)
+        self._pending_research_click: Optional[dict] = None
+        self._pending_research_click_timer = QTimer(self)
+        self._pending_research_click_timer.setSingleShot(True)
+        self._pending_research_click_timer.timeout.connect(self._flush_pending_research_click)
+        self._last_research_event_signature: Optional[Tuple[int, int, int]] = None
 
         self._setup_ui()
+        if self._research_mode_enabled:
+            QApplication.instance().installEventFilter(self)
+            self._research_ui_timer.start()
         QTimer.singleShot(0, self._apply_canvas_sizing)
 
     def eventFilter(self, watched: QObject, event) -> bool:
+        if self._research_mode_enabled:
+            self._handle_research_event_filter(watched, event)
         if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape):
             handled = super().eventFilter(watched, event)
             QTimer.singleShot(0, self._focus_canvas)
@@ -1081,7 +1126,8 @@ class AnnotatorMainWindow(QMainWindow):
 
         model_form = QFormLayout()
         self.checkpoint_combo = QComboBox()
-        self.checkpoint_combo.addItem("Use default HF checkpoint")
+        for label, checkpoint_path in CHECKPOINT_PRESET_OPTIONS:
+            self.checkpoint_combo.addItem(label, checkpoint_path)
         self.checkpoint_combo.setEditable(True)
         self.checkpoint_combo.lineEdit().setPlaceholderText("Optional local checkpoint path")
         model_form.addRow("Checkpoint", self.checkpoint_combo)
@@ -1320,6 +1366,29 @@ class AnnotatorMainWindow(QMainWindow):
             self._on_use_one_session_chunked_propagation_toggled
         )
         experimental_layout.addWidget(self.use_one_session_chunked_propagation_check)
+
+        self.smart_propagation_check = QCheckBox("Enable Smart Propagation")
+        self.smart_propagation_check.setChecked(self.smart_propagation_enabled)
+        self.smart_propagation_check.setToolTip(
+            "On target-frame tracker runs, rewind a few frames and run a larger recovery chunk after an object disappears."
+        )
+        self.smart_propagation_check.toggled.connect(self._on_experimental_settings_changed)
+        experimental_layout.addWidget(self.smart_propagation_check)
+
+        self.smart_propagation_rewind_spin = QSpinBox()
+        self.smart_propagation_rewind_spin.setMinimum(0)
+        self.smart_propagation_rewind_spin.setMaximum(9999)
+        self.smart_propagation_rewind_spin.setValue(self.smart_propagation_rewind_frames)
+        self.smart_propagation_rewind_spin.valueChanged.connect(self._on_experimental_settings_changed)
+        experimental_form.addRow("Smart Rewind Frames", self.smart_propagation_rewind_spin)
+
+        self.smart_propagation_chunk_size_spin = QSpinBox()
+        self.smart_propagation_chunk_size_spin.setMinimum(2)
+        self.smart_propagation_chunk_size_spin.setMaximum(9999)
+        self.smart_propagation_chunk_size_spin.setValue(self.smart_propagation_recovery_chunk_size)
+        self.smart_propagation_chunk_size_spin.valueChanged.connect(self._on_experimental_settings_changed)
+        experimental_form.addRow("Recovery Chunk Size", self.smart_propagation_chunk_size_spin)
+
         experimental_layout.addLayout(experimental_form)
         prompt_layout.addStretch(1)
         processing_layout.addStretch(1)
@@ -1369,6 +1438,9 @@ class AnnotatorMainWindow(QMainWindow):
         self._install_focus_return_on_widget(self.recondition_high_conf_thresh_spin)
         self._install_focus_return_on_widget(self.recondition_high_iou_thresh_spin)
         self._install_focus_return_on_widget(self.use_one_session_chunked_propagation_check)
+        self._install_focus_return_on_widget(self.smart_propagation_check)
+        self._install_focus_return_on_widget(self.smart_propagation_rewind_spin)
+        self._install_focus_return_on_widget(self.smart_propagation_chunk_size_spin)
         self._sync_propagation_mode_controls()
         self._status_label = QLabel("Load a frame directory to start")
         self._status_progress = QProgressBar()
@@ -1380,6 +1452,19 @@ class AnnotatorMainWindow(QMainWindow):
         self.statusBar().addWidget(self._status_label, 1)
         self.statusBar().addWidget(self._coords_label)
         self.statusBar().addPermanentWidget(self._status_progress)
+        if self._research_mode_enabled:
+            self._research_status_label = QLabel("Research: --:--:--")
+            self._research_pause_btn = QPushButton("Pause")
+            self._research_resume_btn = QPushButton("Resume")
+            self._research_hide_btn = QPushButton("Hide Timer")
+            self._research_pause_btn.clicked.connect(self._pause_research_experiment)
+            self._research_resume_btn.clicked.connect(self._resume_research_experiment)
+            self._research_hide_btn.clicked.connect(self._toggle_research_visibility)
+            self.statusBar().addPermanentWidget(self._research_status_label)
+            self.statusBar().addPermanentWidget(self._research_pause_btn)
+            self.statusBar().addPermanentWidget(self._research_resume_btn)
+            self.statusBar().addPermanentWidget(self._research_hide_btn)
+            self._update_research_status_widgets()
 
     def _on_prompt_mode_changed(self, idx: int) -> None:
         self.current_prompt_positive = idx == 0
@@ -1411,6 +1496,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.use_one_session_chunked_propagation = checked
         if not checked:
             self._one_session_chunk_prompt_version = None
+        self._sync_experimental_controls()
 
     def _on_experimental_settings_changed(self, _value) -> None:
         if hasattr(self, "recondition_every_nth_frame_spin"):
@@ -1419,6 +1505,13 @@ class AnnotatorMainWindow(QMainWindow):
             self.recondition_high_conf_thresh = float(self.recondition_high_conf_thresh_spin.value())
         if hasattr(self, "recondition_high_iou_thresh_spin"):
             self.recondition_high_iou_thresh = float(self.recondition_high_iou_thresh_spin.value())
+        if hasattr(self, "smart_propagation_check"):
+            self.smart_propagation_enabled = bool(self.smart_propagation_check.isChecked())
+        if hasattr(self, "smart_propagation_rewind_spin"):
+            self.smart_propagation_rewind_frames = int(self.smart_propagation_rewind_spin.value())
+        if hasattr(self, "smart_propagation_chunk_size_spin"):
+            self.smart_propagation_recovery_chunk_size = int(self.smart_propagation_chunk_size_spin.value())
+        self._sync_experimental_controls()
         self._apply_experimental_settings_live()
 
     def _apply_experimental_settings_live(self) -> None:
@@ -1455,6 +1548,28 @@ class AnnotatorMainWindow(QMainWindow):
                 bool(self.use_one_session_chunked_propagation)
             )
             self.use_one_session_chunked_propagation_check.blockSignals(False)
+        smart_controls_enabled = not bool(self.use_one_session_chunked_propagation)
+        if hasattr(self, "smart_propagation_check"):
+            self.smart_propagation_check.blockSignals(True)
+            self.smart_propagation_check.setChecked(bool(self.smart_propagation_enabled))
+            self.smart_propagation_check.setEnabled(smart_controls_enabled)
+            tooltip = (
+                "On target-frame tracker runs, rewind a few frames and run a larger recovery chunk after an object disappears."
+            )
+            if not smart_controls_enabled:
+                tooltip += " Disabled while one-session chunked propagation is enabled."
+            self.smart_propagation_check.setToolTip(tooltip)
+            self.smart_propagation_check.blockSignals(False)
+        if hasattr(self, "smart_propagation_rewind_spin"):
+            self.smart_propagation_rewind_spin.blockSignals(True)
+            self.smart_propagation_rewind_spin.setValue(int(self.smart_propagation_rewind_frames))
+            self.smart_propagation_rewind_spin.setEnabled(smart_controls_enabled)
+            self.smart_propagation_rewind_spin.blockSignals(False)
+        if hasattr(self, "smart_propagation_chunk_size_spin"):
+            self.smart_propagation_chunk_size_spin.blockSignals(True)
+            self.smart_propagation_chunk_size_spin.setValue(int(self.smart_propagation_recovery_chunk_size))
+            self.smart_propagation_chunk_size_spin.setEnabled(smart_controls_enabled)
+            self.smart_propagation_chunk_size_spin.blockSignals(False)
 
     def _on_propagation_target_toggled(self, checked: bool) -> None:
         self.use_target_frame = checked
@@ -1497,6 +1612,22 @@ class AnnotatorMainWindow(QMainWindow):
             self.computed_chunks_label.setText("Chunks: -")
         else:
             self.computed_chunks_label.setText(f"Chunks: {chunks}")
+
+    def _smart_propagation_settings(self) -> SmartPropagationSettings:
+        return SmartPropagationSettings(
+            enabled=bool(self.smart_propagation_enabled),
+            rewind_frames=int(self.smart_propagation_rewind_frames),
+            recovery_chunk_size=int(self.smart_propagation_recovery_chunk_size),
+        )
+
+    def _is_smart_propagation_available_for_run(self) -> bool:
+        settings = self._smart_propagation_settings()
+        return (
+            settings.enabled
+            and self.use_target_frame_check.isChecked()
+            and self._is_tracker_propagation_mode()
+            and not self.use_one_session_chunked_propagation
+        )
 
     def request_stop_propagation(self) -> None:
         if not self._propagation_busy:
@@ -2258,6 +2389,10 @@ class AnnotatorMainWindow(QMainWindow):
         self.recondition_high_conf_thresh_spin.setEnabled(enabled)
         self.recondition_high_iou_thresh_spin.setEnabled(enabled)
         self.use_one_session_chunked_propagation_check.setEnabled(enabled)
+        smart_controls_enabled = enabled and not self.use_one_session_chunked_propagation
+        self.smart_propagation_check.setEnabled(smart_controls_enabled)
+        self.smart_propagation_rewind_spin.setEnabled(smart_controls_enabled)
+        self.smart_propagation_chunk_size_spin.setEnabled(smart_controls_enabled)
         running = self._propagation_busy
         pending = self._pending_propagation is not None
         self.stop_propagate_btn.setEnabled(running or pending)
@@ -2356,12 +2491,31 @@ class AnnotatorMainWindow(QMainWindow):
         self._set_status(f"Loaded {len(self.frame_paths)} frames from {dir_path}", progress=1, total=1)
         self._reset_prefetch_state()
         self._session_dir = None
+        self._start_new_research_experiment(dir_path, start_paused=False)
 
     def _read_optional_combo_path(self, combo: QComboBox) -> Optional[str]:
         text = combo.currentText().strip()
         if not text or text.lower().startswith("use default"):
             return None
+        selected_data = combo.currentData()
+        if isinstance(selected_data, str) and combo.currentIndex() >= 0:
+            selected_label = combo.itemText(combo.currentIndex()).strip()
+            if text == selected_label:
+                return selected_data
         return text
+
+    def _set_optional_combo_path(self, combo: QComboBox, value: Optional[str]) -> None:
+        if not value:
+            combo.setCurrentIndex(0)
+            return
+
+        value_str = str(value).strip()
+        for idx in range(combo.count()):
+            item_data = combo.itemData(idx)
+            if isinstance(item_data, str) and item_data == value_str:
+                combo.setCurrentIndex(idx)
+                return
+        combo.setCurrentText(value_str)
 
     def add_object(self) -> None:
         name, ok = QInputDialog.getText(self, "Add Object", "Object name:")
@@ -2771,6 +2925,9 @@ class AnnotatorMainWindow(QMainWindow):
         if mapped is None:
             return
         x_px, y_px = mapped
+        if self._research_mode_enabled:
+            target_name = "canvas_box_press" if self._is_box_mode() else "canvas_prompt_press"
+            self._queue_canvas_research_click(target_name, x_px, y_px, "single_click")
 
         if self._is_box_mode():
             if not self.show_boxes:
@@ -2809,6 +2966,9 @@ class AnnotatorMainWindow(QMainWindow):
         mapped = self._map_ui_to_image_xy(ui_x, ui_y)
         if mapped is None:
             return
+        if self._research_mode_enabled:
+            self._cancel_pending_research_click("canvas")
+            self._record_canvas_research_event("canvas_double_click", mapped[0], mapped[1], "double_click")
         hit = self._find_box_at_point(*mapped)
         if hit is None:
             return
@@ -3093,8 +3253,12 @@ class AnnotatorMainWindow(QMainWindow):
                 n_frames=self.n_propagate_spin.value(),
                 total_chunks=total_chunks,
                 target_frame_idx=target_frame_idx,
+                run_start_frame_idx=self.current_frame_idx,
+                active_chunk_n_frames=self.n_propagate_spin.value(),
             )
             self._propagation_stop_requested = False
+            self._propagation_smart_restart_requested = False
+            self._smart_propagation_triggered_loss_keys.clear()
             target_note = ""
             if target_frame_idx is not None:
                 target_note = f" (target frame {target_frame_idx + 1})"
@@ -3373,18 +3537,25 @@ class AnnotatorMainWindow(QMainWindow):
             self._clear_pending_propagation_state()
             return
 
+        chunk_n_frames = int(state.active_chunk_n_frames or state.n_frames)
         self._propagation_busy = True
         self._propagation_active_chunk_idx = chunk_idx
         self._propagation_active_seed_frame_idx = seed_frame_idx
-        self._propagation_seen_obj_ids.clear()
-        self._propagation_lost_obj_ids.clear()
-        self._propagation_loss_notified = False
         self._set_propagation_ui_enabled(False)
-        self._set_status(
-            f"Chunk {chunk_idx}/{state.total_chunks} running...",
-            progress=state.completed_chunks,
-            total=state.total_chunks,
-        )
+        if state.pending_smart_restart_seed_frame_idx is not None:
+            loss_frame_idx = state.pending_smart_restart_loss_frame_idx
+            restart_note = f"Smart restart: rewound to frame {seed_frame_idx + 1}"
+            if loss_frame_idx is not None:
+                restart_note += f" after loss on frame {loss_frame_idx + 1}"
+            self._set_status(restart_note, progress=state.completed_chunks, total=max(1, state.total_chunks))
+            state.pending_smart_restart_seed_frame_idx = None
+            state.pending_smart_restart_loss_frame_idx = None
+        else:
+            self._set_status(
+                f"Chunk {chunk_idx}/{state.total_chunks} running...",
+                progress=state.completed_chunks,
+                total=state.total_chunks,
+            )
         use_one_session = self.use_one_session_chunked_propagation
         rebuild_one_session = bool(use_one_session and state.completed_chunks == 0)
         if use_one_session and self._one_session_chunk_prompt_version != self._prefetch_prompt_version:
@@ -3394,7 +3565,7 @@ class AnnotatorMainWindow(QMainWindow):
             "propagate",
             {
                 "seed_frame_idx": seed_frame_idx,
-                "n_frames": state.n_frames,
+                "n_frames": chunk_n_frames,
                 "frame_paths": self.frame_paths,
                 "prompt_payload": prompt_payload,
                 "use_one_session": use_one_session,
@@ -3406,6 +3577,7 @@ class AnnotatorMainWindow(QMainWindow):
             "seed_frame_idx": seed_frame_idx,
             "last_emitted_frame_idx": seed_frame_idx - 1,
             "use_one_session": use_one_session,
+            "n_frames": chunk_n_frames,
         }
         self._propagation_task_id = task_id
 
@@ -3545,11 +3717,119 @@ class AnnotatorMainWindow(QMainWindow):
         state = self._pending_propagation
         if kind == "manual" and state is not None:
             context["last_emitted_frame_idx"] = abs_frame_idx
+            self._maybe_request_smart_propagation_restart(
+                abs_frame_idx=abs_frame_idx,
+                output=output,
+                enabled_obj_ids=self._propagation_enabled_obj_ids or set(),
+                state=state,
+                task_id=task_id,
+            )
+            if self._propagation_smart_restart_requested:
+                return
             self._set_status(
                 f"Chunk {state.completed_chunks + 1}/{state.total_chunks}: {session_idx + 1}/{total_frames} frames",
                 progress=state.completed_chunks,
                 total=state.total_chunks,
             )
+
+    def _maybe_request_smart_propagation_restart(
+        self,
+        *,
+        abs_frame_idx: int,
+        output: SamFrameOutput,
+        enabled_obj_ids: set[int],
+        state: PendingPropagationState,
+        task_id: str,
+    ) -> None:
+        if self._propagation_smart_restart_requested or not enabled_obj_ids:
+            return
+        if not self._is_smart_propagation_available_for_run():
+            return
+        cooldown_until_frame_idx = state.smart_restart_cooldown_until_frame_idx
+        if cooldown_until_frame_idx is not None and abs_frame_idx <= cooldown_until_frame_idx:
+            return
+
+        has_mask_by_obj_id = {int(obj_id): False for obj_id in enabled_obj_ids}
+        for idx, obj_id in enumerate(output.obj_ids):
+            obj_id_int = int(obj_id)
+            if obj_id_int not in has_mask_by_obj_id or idx >= len(output.masks):
+                continue
+            has_mask = bool(np.asarray(output.masks[idx]).any())
+            has_mask_by_obj_id[obj_id_int] = has_mask
+            if has_mask:
+                self._propagation_seen_obj_ids.add(obj_id_int)
+                self._smart_propagation_waiting_for_recovery_obj_ids.discard(obj_id_int)
+
+        candidate_obj_ids = {
+            int(obj_id)
+            for obj_id in enabled_obj_ids
+            if int(obj_id) not in self._smart_propagation_waiting_for_recovery_obj_ids
+        }
+        if not candidate_obj_ids:
+            return
+
+        decision = detect_smart_propagation_restart(
+            enabled_obj_ids=candidate_obj_ids,
+            has_mask_by_obj_id=has_mask_by_obj_id,
+            previously_seen_obj_ids=self._propagation_seen_obj_ids,
+            already_triggered_loss_keys=self._smart_propagation_triggered_loss_keys,
+            loss_frame_idx=abs_frame_idx,
+            run_start_frame_idx=state.run_start_frame_idx,
+            rewind_frames=self.smart_propagation_rewind_frames,
+        )
+        if not decision.should_restart:
+            return
+
+        restart_seed_frame_idx = decision.restart_seed_frame_idx
+        loss_frame_idx = decision.loss_frame_idx
+        if restart_seed_frame_idx is None or loss_frame_idx is None:
+            return
+        if restart_seed_frame_idx >= abs_frame_idx:
+            return
+
+        self._propagation_smart_restart_requested = True
+        state.pending_smart_restart_seed_frame_idx = restart_seed_frame_idx
+        state.pending_smart_restart_loss_frame_idx = loss_frame_idx
+        state.smart_restart_cooldown_until_frame_idx = loss_frame_idx
+        state.next_seed_frame_idx = restart_seed_frame_idx
+        state.active_chunk_n_frames = self.smart_propagation_recovery_chunk_size
+        for obj_id in decision.lost_obj_ids:
+            self._smart_propagation_triggered_loss_keys.add((int(obj_id), loss_frame_idx))
+            self._propagation_lost_obj_ids.add(int(obj_id))
+            self._smart_propagation_waiting_for_recovery_obj_ids.add(int(obj_id))
+        context = self._sam_task_contexts.get(task_id)
+        if context is not None:
+            context["last_emitted_frame_idx"] = abs_frame_idx
+        self._set_status(
+            f"Smart propagation triggered at frame {abs_frame_idx + 1}; rewinding to frame {restart_seed_frame_idx + 1}.",
+            progress=state.completed_chunks,
+            total=max(1, state.total_chunks),
+        )
+        if self._sam_worker is not None:
+            self._sam_worker.cancel_propagation()
+
+    def _handle_smart_propagation_restart_after_stop(self, context: Dict[str, object]) -> None:
+        state = self._pending_propagation
+        if state is None:
+            self._clear_pending_propagation_state()
+            return
+
+        restart_seed_frame_idx = state.pending_smart_restart_seed_frame_idx
+        if restart_seed_frame_idx is None:
+            self._clear_pending_propagation_state()
+            return
+
+        last_emitted_frame_idx = int(context.get("last_emitted_frame_idx", restart_seed_frame_idx))
+        enabled_obj_ids = self._propagation_enabled_obj_ids or set()
+        self._clear_replayed_propagation_range(
+            start_seed_frame_idx=restart_seed_frame_idx,
+            end_frame_idx=last_emitted_frame_idx,
+            obj_ids=enabled_obj_ids,
+        )
+        self._propagation_busy = False
+        self._set_propagation_ui_enabled(True)
+        self._propagation_smart_restart_requested = False
+        self._start_propagation_chunk_async(enabled_obj_ids=enabled_obj_ids, state=state)
 
     def _on_sam_propagate_done(self, task_id: str, last_masked_frame_idx: int, chunk_last_frame_idx: int) -> None:
         context = self._sam_task_contexts.get(task_id, {})
@@ -3577,9 +3857,7 @@ class AnnotatorMainWindow(QMainWindow):
         state.remaining_chunks -= 1
         state.completed_chunks += 1
         state.next_seed_frame_idx = last_masked_frame_idx
-        self._propagation_seen_obj_ids.clear()
-        self._propagation_lost_obj_ids.clear()
-        self._propagation_loss_notified = False
+        state.active_chunk_n_frames = state.n_frames
         if state.target_frame_idx is not None:
             recomputed = self._compute_target_chunk_count(
                 state.next_seed_frame_idx,
@@ -3643,7 +3921,10 @@ class AnnotatorMainWindow(QMainWindow):
         if kind in {"manual", "auto"}:
             self._propagation_busy = False
             self._set_propagation_ui_enabled(True)
-            self._clear_pending_propagation_state()
+            if kind == "manual" and self._pending_propagation is not None and self._propagation_smart_restart_requested:
+                self._handle_smart_propagation_restart_after_stop(context)
+            else:
+                self._clear_pending_propagation_state()
 
         self._sam_task_results[task_id] = None
         loop = self._sam_waiting.get(task_id)
@@ -4000,6 +4281,32 @@ class AnnotatorMainWindow(QMainWindow):
             tracker_scores=[output.tracker_scores[i] for i in keep_idx],
         )
 
+    def _clear_replayed_propagation_range(
+        self,
+        *,
+        start_seed_frame_idx: int,
+        end_frame_idx: int,
+        obj_ids: set[int],
+    ) -> None:
+        if not obj_ids or end_frame_idx <= start_seed_frame_idx:
+            return
+        start_frame_idx = max(0, start_seed_frame_idx + 1)
+        final_frame_idx = min(end_frame_idx, len(self.frame_paths) - 1)
+        for frame_idx in range(start_frame_idx, final_frame_idx + 1):
+            frame_boxes = self.box_prompts_by_frame_obj.get(frame_idx)
+            if frame_boxes is not None:
+                for obj_id in obj_ids:
+                    frame_boxes.pop(obj_id, None)
+                    self._set_current_box_locked(frame_idx, obj_id, False)
+                if not frame_boxes:
+                    self.box_prompts_by_frame_obj.pop(frame_idx, None)
+            for obj_id in obj_ids:
+                self._remove_object_output_from_frame(frame_idx, obj_id)
+        if self.current_frame_idx >= start_frame_idx and self.current_frame_idx <= final_frame_idx:
+            self._sync_current_box_lock_check()
+            self.refresh_point_list()
+            self._render_current_frame()
+
     def _remove_object_annotations_from_frame(self, frame_idx: int, obj_id: Optional[int]) -> None:
         if obj_id is None:
             return
@@ -4311,7 +4618,10 @@ class AnnotatorMainWindow(QMainWindow):
         self._propagation_stop_requested = False
         self._propagation_seen_obj_ids.clear()
         self._propagation_lost_obj_ids.clear()
+        self._smart_propagation_waiting_for_recovery_obj_ids.clear()
         self._propagation_loss_notified = False
+        self._propagation_smart_restart_requested = False
+        self._smart_propagation_triggered_loss_keys.clear()
         if hasattr(self, "stop_propagate_btn"):
             self.stop_propagate_btn.setEnabled(False)
         self._schedule_prefetch_for_next_frame()
@@ -4466,6 +4776,9 @@ class AnnotatorMainWindow(QMainWindow):
                 "recondition_high_conf_thresh": float(self.recondition_high_conf_thresh),
                 "recondition_high_iou_thresh": float(self.recondition_high_iou_thresh),
                 "use_one_session_chunked_propagation": bool(self.use_one_session_chunked_propagation),
+                "smart_propagation_enabled": bool(self.smart_propagation_enabled),
+                "smart_propagation_rewind_frames": int(self.smart_propagation_rewind_frames),
+                "smart_propagation_recovery_chunk_size": int(self.smart_propagation_recovery_chunk_size),
             },
             "prompt_mode_index": int(self.prompt_mode_combo.currentIndex()),
         }
@@ -4520,6 +4833,7 @@ class AnnotatorMainWindow(QMainWindow):
             data["outputs"][str(frame_idx)] = entry
 
         write_session_json(session_dir / "session.json", data)
+        self._save_research_data(session_dir)
         self._set_status("Session saved.", progress=1, total=1)
 
     def _load_session(self, session_path: Path) -> None:
@@ -4586,10 +4900,7 @@ class AnnotatorMainWindow(QMainWindow):
             )
 
         self._checkpoint_path = data.get("checkpoint_path")
-        if self._checkpoint_path:
-            self.checkpoint_combo.setCurrentText(self._checkpoint_path)
-        else:
-            self.checkpoint_combo.setCurrentIndex(0)
+        self._set_optional_combo_path(self.checkpoint_combo, self._checkpoint_path)
         experimental = data.get("experimental", {})
         self.recondition_every_nth_frame = int(
             experimental.get(
@@ -4611,6 +4922,21 @@ class AnnotatorMainWindow(QMainWindow):
         )
         self.use_one_session_chunked_propagation = bool(
             experimental.get("use_one_session_chunked_propagation", False)
+        )
+        self.smart_propagation_enabled = bool(
+            experimental.get("smart_propagation_enabled", False)
+        )
+        self.smart_propagation_rewind_frames = int(
+            experimental.get(
+                "smart_propagation_rewind_frames",
+                DEFAULT_SMART_PROPAGATION_REWIND_FRAMES,
+            )
+        )
+        self.smart_propagation_recovery_chunk_size = int(
+            experimental.get(
+                "smart_propagation_recovery_chunk_size",
+                DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE,
+            )
         )
         self._sync_experimental_controls()
         update_progress(20, "Initializing SAM worker...")
@@ -4793,8 +5119,251 @@ class AnnotatorMainWindow(QMainWindow):
         }
         self._undo_state = None
         self._last_prompt_edit_frame = None
+        self._load_research_data(session_dir, frame_dir)
         update_progress(100, "Session loaded.")
         progress_dialog.close()
+
+    def _format_research_elapsed(self, elapsed_ms: int) -> str:
+        total_seconds = max(0, int(elapsed_ms // 1000))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _update_research_status_widgets(self) -> None:
+        if not self._research_mode_enabled:
+            return
+        tracker = self._research_tracker
+        if tracker is None:
+            return
+        if hasattr(self, "_research_status_label"):
+            if tracker.started_at is None:
+                self._research_status_label.setText("Research: --:--:--")
+            elif tracker.is_hidden:
+                self._research_status_label.setText("Research: hidden")
+            else:
+                self._research_status_label.setText(
+                    f"Research: {self._format_research_elapsed(tracker.current_elapsed_ms())}"
+                )
+            self._research_status_label.setVisible(not tracker.is_hidden)
+        if hasattr(self, "_research_pause_btn"):
+            self._research_pause_btn.setEnabled(tracker.started_at is not None and not tracker.is_paused)
+        if hasattr(self, "_research_resume_btn"):
+            self._research_resume_btn.setEnabled(tracker.started_at is not None and tracker.is_paused)
+        if hasattr(self, "_research_hide_btn"):
+            self._research_hide_btn.setEnabled(tracker.started_at is not None)
+            self._research_hide_btn.setText("Show Timer" if tracker.is_hidden else "Hide Timer")
+
+    def _start_new_research_experiment(self, frame_dir: Path, start_paused: bool) -> None:
+        if not self._research_mode_enabled or self._research_tracker is None:
+            return
+        self._pending_research_click = None
+        self._pending_research_click_timer.stop()
+        self._last_research_event_signature = None
+        self._research_tracker.start_new(frame_dir, start_paused=start_paused)
+        self._update_research_status_widgets()
+
+    def _pause_research_experiment(self) -> None:
+        if self._research_tracker is None:
+            return
+        self._research_tracker.pause()
+        self._update_research_status_widgets()
+
+    def _resume_research_experiment(self) -> None:
+        if self._research_tracker is None:
+            return
+        self._research_tracker.resume()
+        self._update_research_status_widgets()
+
+    def _toggle_research_visibility(self) -> None:
+        if self._research_tracker is None:
+            return
+        self._research_tracker.set_hidden(not self._research_tracker.is_hidden)
+        self._update_research_status_widgets()
+
+    def _save_research_data(self, session_dir: Path) -> None:
+        if not self._research_mode_enabled or self._research_tracker is None or self.image_dir is None:
+            return
+        self._flush_pending_research_click()
+        write_session_json(session_dir / "research.json", self._research_tracker.to_dict())
+
+    def _load_research_data(self, session_dir: Path, frame_dir: Path) -> None:
+        if not self._research_mode_enabled or self._research_tracker is None:
+            return
+        research_path = session_dir / "research.json"
+        if research_path.exists():
+            try:
+                self._research_tracker.load(read_session_json(research_path), default_frame_dir=frame_dir)
+            except Exception:
+                self._research_tracker.start_new(frame_dir, start_paused=True)
+        else:
+            self._research_tracker.start_new(frame_dir, start_paused=True)
+        self._research_tracker.pause()
+        self._pending_research_click = None
+        self._pending_research_click_timer.stop()
+        self._last_research_event_signature = None
+        self._update_research_status_widgets()
+
+    def _handle_research_event_filter(self, watched: QObject, event) -> None:
+        if self._research_tracker is None or self._research_tracker.started_at is None:
+            return
+        if watched is self.image_label:
+            return
+        if event.type() not in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+            return
+        if not hasattr(event, "button") or event.button() != Qt.LeftButton:
+            return
+        if not isinstance(watched, QWidget):
+            return
+        if not watched.isEnabled() or not watched.isVisible():
+            return
+        event_timestamp = int(event.timestamp()) if hasattr(event, "timestamp") else 0
+        signature = (id(watched), int(event.type()), event_timestamp)
+        if self._last_research_event_signature == signature:
+            return
+        self._last_research_event_signature = signature
+        target = self._classify_research_widget_target(watched)
+        if target is None:
+            return
+        event_data = {
+            "frame_idx": self.current_frame_idx if self.frame_paths else None,
+            "target_type": target["target_type"],
+            "target_name": target["target_name"],
+            "widget_class": watched.__class__.__name__,
+        }
+        if event.type() == QEvent.MouseButtonDblClick:
+            if (
+                self._pending_research_click is not None
+                and self._pending_research_click.get("target_name") == event_data["target_name"]
+                and self._pending_research_click.get("target_type") == event_data["target_type"]
+            ):
+                self._pending_research_click_timer.stop()
+                self._pending_research_click = None
+            self._research_tracker.record_event(event_data)
+            self._update_research_status_widgets()
+            return
+        if self._pending_research_click is not None:
+            same_target = (
+                self._pending_research_click.get("target_name") == event_data["target_name"]
+                and self._pending_research_click.get("target_type") == event_data["target_type"]
+            )
+            if not same_target:
+                self._flush_pending_research_click()
+        self._pending_research_click = event_data
+        self._pending_research_click_timer.start(QApplication.doubleClickInterval())
+
+    def _flush_pending_research_click(self) -> None:
+        if self._research_tracker is None or self._pending_research_click is None:
+            return
+        self._research_tracker.record_event(self._pending_research_click)
+        self._pending_research_click = None
+        self._update_research_status_widgets()
+
+    def _cancel_pending_research_click(self, target_type: Optional[str] = None) -> None:
+        if self._pending_research_click is None:
+            return
+        if target_type is not None and self._pending_research_click.get("target_type") != target_type:
+            return
+        self._pending_research_click = None
+        self._pending_research_click_timer.stop()
+
+    def _queue_canvas_research_click(
+        self,
+        target_name: str,
+        x_px: int,
+        y_px: int,
+        gesture_kind: str,
+    ) -> None:
+        if self._research_tracker is None or self._research_tracker.started_at is None:
+            return
+        if self._pending_research_click is not None:
+            self._flush_pending_research_click()
+        self._pending_research_click = {
+            "frame_idx": self.current_frame_idx if self.frame_paths else None,
+            "target_type": "canvas",
+            "target_name": target_name,
+            "widget_class": self.image_label.__class__.__name__,
+            "canvas_x_px": int(x_px),
+            "canvas_y_px": int(y_px),
+            "canvas_context": {
+                "gesture_kind": gesture_kind,
+                "prompt_mode_index": int(self.prompt_mode_combo.currentIndex()),
+                "active_object_id": int(self.active_object_id) if self.active_object_id is not None else None,
+            },
+        }
+        self._pending_research_click_timer.start(QApplication.doubleClickInterval())
+
+    def _record_canvas_research_event(
+        self,
+        target_name: str,
+        x_px: int,
+        y_px: int,
+        gesture_kind: str,
+    ) -> None:
+        if self._research_tracker is None or self._research_tracker.started_at is None:
+            return
+        self._pending_research_click = None
+        self._pending_research_click_timer.stop()
+        self._research_tracker.record_event(
+            {
+                "frame_idx": self.current_frame_idx if self.frame_paths else None,
+                "target_type": "canvas",
+                "target_name": target_name,
+                "widget_class": self.image_label.__class__.__name__,
+                "canvas_x_px": int(x_px),
+                "canvas_y_px": int(y_px),
+                "canvas_context": {
+                    "gesture_kind": gesture_kind,
+                    "prompt_mode_index": int(self.prompt_mode_combo.currentIndex()),
+                    "active_object_id": int(self.active_object_id) if self.active_object_id is not None else None,
+                },
+            }
+        )
+        self._update_research_status_widgets()
+
+    def _classify_research_widget_target(self, widget: QWidget) -> Optional[Dict[str, str]]:
+        if widget is self.image_label:
+            return None
+        target_type = "widget"
+        if isinstance(widget, QAbstractButton):
+            if isinstance(widget, QCheckBox):
+                target_type = "checkbox"
+            elif isinstance(widget, QToolButton):
+                target_type = "toolbutton"
+            else:
+                target_type = "button"
+        elif isinstance(widget, QAbstractSlider):
+            target_type = "slider"
+        elif isinstance(widget, QListWidget):
+            target_type = "list"
+        elif isinstance(widget, QComboBox):
+            target_type = "combo"
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox, QAbstractSpinBox)):
+            target_type = "spinbox"
+        elif isinstance(widget, QLineEdit):
+            target_type = "lineedit"
+        elif isinstance(widget, QMenu):
+            target_type = "menu"
+        target_name = self._research_widget_name(widget)
+        return {"target_type": target_type, "target_name": target_name}
+
+    def _research_widget_name(self, widget: QWidget) -> str:
+        name = widget.objectName().strip() if widget.objectName() else ""
+        if name:
+            return name
+        if isinstance(widget, (QPushButton, QToolButton, QCheckBox)):
+            text = widget.text().strip()
+            if text:
+                return text
+        if isinstance(widget, QLabel):
+            text = widget.text().strip()
+            if text:
+                return text
+        if isinstance(widget, QComboBox):
+            text = widget.currentText().strip()
+            if text:
+                return f"{widget.__class__.__name__}:{text}"
+        return widget.__class__.__name__
 
     def _render_current_frame(self) -> None:
         if not self.frame_paths:
@@ -5506,8 +6075,11 @@ class AnnotatorMainWindow(QMainWindow):
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
-    win = AnnotatorMainWindow()
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--research-mode", action="store_true")
+    args, remaining = parser.parse_known_args(sys.argv[1:])
+    app = QApplication([sys.argv[0], *remaining])
+    win = AnnotatorMainWindow(research_mode_enabled=args.research_mode)
     win.show()
     return app.exec()
 

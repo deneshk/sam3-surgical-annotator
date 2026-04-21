@@ -12,7 +12,7 @@
 - `Lock Current Box` preserves a manual box on the current frame and prevents SAM3 from overwriting it there.
 - The current frame annotation list stays visible in the main UI, including the box plus any point prompts for the active object.
 - View controls now live in the `Prompting` tab, including prompt/segmentation/box visibility, box titles, mask opacity, and box thickness.
-- An `Experimental Features` tab exposes SAM3 periodic re-prompt controls for frame interval, confidence threshold, IoU threshold, and an experimental one-session chunked propagation toggle.
+- An `Experimental Features` tab exposes SAM3 periodic re-prompt controls for frame interval, confidence threshold, IoU threshold, an experimental one-session chunked propagation toggle, and smart propagation rewind controls.
 - Clicks add positive/negative point prompts (up to 6) for active object on current frame.
 - Box prompts can be drawn by selecting `Box (drag)` and dragging on the image.
 - Existing box prompts can be edited while `Box (drag)` mode is active:
@@ -30,6 +30,8 @@
 - `Auto Propagate Next Frame` can propagate checked objects one frame ahead when the right arrow is used.
 - `Use Point Prompts for Propagation` controls whether current-frame point prompts are included as tracker seed inputs; boxes and seed masks still propagate when it is off.
 - `Use One Session for Chunked Propagation` keeps manual chunking in the UI while reusing one full-video SAM3 session across chunks for that propagation run.
+- `Enable Smart Propagation` is available for target-frame tracker runs. When an enabled object disappears after being tracked earlier in the run, propagation rewinds a few frames and launches one larger recovery chunk before returning to the normal chunk size.
+  - After a rewind, the same object will not trigger another smart rewind until it is seen with a non-empty mask again.
 - `Prop` is frame-local: unlabeled frames show unchecked/disabled, labeled frames auto-check again, and manual unchecks are remembered on that frame.
 - Internally, each box prompt is passed to SAM3 as two point prompts with labels `(2, 3)`.
 - View controls let you independently show/hide prompts, segmentations, and derived boxes.
@@ -53,6 +55,7 @@
   - `Stop` cancels propagation immediately
 - Exports COCO-style JSON and mask PNG files.
 - Save/Load session files (JSON + mask PNGs) with optional auto-save.
+- Optional `--research-mode` tracks live experiment time plus left-click interaction events and saves them to `research.json`.
 
 ## Install
 From `sam3v2/`:
@@ -69,6 +72,12 @@ From `sam3v2/`:
 
 ```bash
 python3 surgical_annotator_qt.py
+```
+
+Research mode:
+
+```bash
+python3 surgical_annotator_qt.py --research-mode
 ```
 
 ## Usage
@@ -90,6 +99,7 @@ python3 surgical_annotator_qt.py
    - These settings apply live to future tracker operations.
    - `Re-prompt Every N Frames = 0` disables periodic re-prompting.
    - `Use One Session for Chunked Propagation` changes how tracker chunk propagation reuses SAM3 session state across chunk boundaries.
+   - `Enable Smart Propagation` only applies to tracker propagation when `Use Target Frame` is on, and it is disabled while one-session chunked propagation is enabled.
 8. Click `Propagate`.
     - Only checked objects are included in propagation.
    - The canonical box on the seed frame is used as the primary propagation input.
@@ -98,6 +108,7 @@ python3 surgical_annotator_qt.py
 9. If pause is enabled and chunks remain, review/correct and click `Continue Propagate`.
 10. Use `Save Session` to persist your work (and enable auto-save if desired).
 11. `Export COCO` from menu when done.
+12. In `--research-mode`, use the status-bar timer controls to pause, resume, or hide the live experiment timer.
 
 Text prompt workflow:
 - Enter a frame text prompt such as `dog`.
@@ -124,5 +135,8 @@ Ctrl+Z undoes the last prompt edit (single-step).
 - Text prompts are not tracked prompts. They are only used to generate one-frame proposals that can be accepted into the existing per-object workflow.
 - Experimental periodic re-prompt settings are saved and restored with sessions.
 - The one-session chunked propagation toggle is saved and restored with sessions.
+- Smart propagation settings are saved and restored with sessions.
 - Tracker-side scores are saved and restored with sessions for inspection, but are not exported yet.
+- In `--research-mode`, loading a frame directory starts a fresh experiment timer, and saving a session also writes `research.json` with elapsed time and tracked click events.
+- In `--research-mode`, loading a saved session restores prior research data in a paused state until you resume it.
 - If a chunk returns no valid masks, chunked propagation stops and asks for prompt refinement before retrying.
