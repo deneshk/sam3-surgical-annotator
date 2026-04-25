@@ -7,9 +7,10 @@ isolated from normal annotation flow.
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 from typing import Optional, Tuple
 
-from PySide6.QtCore import QObject, QEvent, Qt, QTimer
+from PySide6.QtCore import QObject, QPoint, QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractSlider,
@@ -29,8 +30,17 @@ from PySide6.QtWidgets import (
 )
 
 from annotator.persistence.session_io import read_session_json, write_session_json
-from annotator.research.experiment import ResearchExperimentTracker
-from annotator.research.models import CanvasContext, ResearchEvent, ResearchWidgetTarget
+from annotator.research.experiment import ResearchExperimentTracker, ResearchMousePositionTracker
+from annotator.research.models import (
+    CanvasContext,
+    MousePositionEvent,
+    ResearchEvent,
+    ResearchWidgetTarget,
+)
+
+
+MOUSE_POSITION_FILENAME = "research_mouse_positions.json"
+MOUSE_POSITION_SAMPLE_INTERVAL_MS = 250
 
 
 class ResearchController:
@@ -42,12 +52,17 @@ class ResearchController:
         self.tracker: Optional[ResearchExperimentTracker] = (
             ResearchExperimentTracker() if self.enabled else None
         )
+        self.mouse_tracker: Optional[ResearchMousePositionTracker] = (
+            ResearchMousePositionTracker() if self.enabled else None
+        )
         self._status_label: Optional[QLabel] = None
         self._pause_button: Optional[QPushButton] = None
         self._resume_button: Optional[QPushButton] = None
         self._hide_button: Optional[QPushButton] = None
         self._pending_click: Optional[ResearchEvent] = None
         self._last_event_signature: Optional[Tuple[int, int, int]] = None
+        self._last_mouse_position_ms: Optional[int] = None
+        self._parent = parent
         self._ui_timer = QTimer(parent)
         self._ui_timer.setInterval(250)
         self._ui_timer.timeout.connect(self.update_status_widgets)
@@ -120,7 +135,10 @@ class ResearchController:
         self._pending_click = None
         self._pending_click_timer.stop()
         self._last_event_signature = None
+        self._last_mouse_position_ms = None
         self.tracker.start_new(frame_dir, start_paused=start_paused)
+        if self.mouse_tracker is not None:
+            self.mouse_tracker.start_new(frame_dir, started_at=self.tracker.started_at)
         self.update_status_widgets()
 
     def pause(self) -> None:
@@ -150,6 +168,11 @@ class ResearchController:
             return
         self.flush_pending_click()
         write_session_json(session_dir / "research.json", self.tracker.to_dict())
+        if self.mouse_tracker is not None:
+            write_session_json(
+                session_dir / MOUSE_POSITION_FILENAME,
+                self.mouse_tracker.to_dict(),
+            )
 
     def load_session(self, session_dir: Path, *, frame_dir: Path) -> None:
         """Restore research telemetry or create a paused session if none exists."""
@@ -167,6 +190,20 @@ class ResearchController:
         self._pending_click = None
         self._pending_click_timer.stop()
         self._last_event_signature = None
+        self._last_mouse_position_ms = None
+        if self.mouse_tracker is not None:
+            mouse_path = session_dir / MOUSE_POSITION_FILENAME
+            if mouse_path.exists():
+                try:
+                    self.mouse_tracker.load(
+                        read_session_json(mouse_path),
+                        default_frame_dir=frame_dir,
+                        default_started_at=self.tracker.started_at,
+                    )
+                except Exception:
+                    self.mouse_tracker.start_new(frame_dir, started_at=self.tracker.started_at)
+            else:
+                self.mouse_tracker.start_new(frame_dir, started_at=self.tracker.started_at)
         self.update_status_widgets()
 
     def handle_widget_event(
@@ -225,6 +262,63 @@ class ResearchController:
                 self.flush_pending_click()
         self._pending_click = event_data
         self._pending_click_timer.start(QApplication.doubleClickInterval())
+
+    def record_mouse_position(
+        self,
+        *,
+        watched: QObject,
+        event,
+        current_frame_idx: int,
+        has_frames: bool,
+        canvas_xy: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        """Record sampled whole-window mouse positions into the independent mouse log."""
+        if self.tracker is None or self.mouse_tracker is None or self.tracker.started_at is None:
+            return
+        if event.type() != QEvent.MouseMove or not isinstance(watched, QWidget):
+            return
+        event_ms = self._mouse_event_timestamp_ms(event)
+        if (
+            self._last_mouse_position_ms is not None
+            and event_ms - self._last_mouse_position_ms < MOUSE_POSITION_SAMPLE_INTERVAL_MS
+        ):
+            return
+        self._last_mouse_position_ms = event_ms
+        target = self._classify_widget_target(watched)
+        widget_x = None
+        widget_y = None
+        window_x = None
+        window_y = None
+        if hasattr(event, "position"):
+            position = event.position()
+            widget_x = int(position.x())
+            widget_y = int(position.y())
+            window_point = self._parent.mapFromGlobal(watched.mapToGlobal(QPoint(widget_x, widget_y)))
+            window_x = int(window_point.x())
+            window_y = int(window_point.y())
+        canvas_x = canvas_xy[0] if canvas_xy is not None else None
+        canvas_y = canvas_xy[1] if canvas_xy is not None else None
+        self.mouse_tracker.record_position(
+            MousePositionEvent(
+                frame_idx=current_frame_idx if has_frames else None,
+                target_type=target.target_type if target is not None else "mouse",
+                target_name=target.target_name if target is not None else "position",
+                widget_class=watched.__class__.__name__,
+                window_x_px=window_x,
+                window_y_px=window_y,
+                widget_x_px=widget_x,
+                widget_y_px=widget_y,
+                canvas_x_px=canvas_x,
+                canvas_y_px=canvas_y,
+            ),
+            elapsed_ms=self.tracker.current_elapsed_ms(),
+        )
+
+    def _mouse_event_timestamp_ms(self, event) -> int:
+        """Return a millisecond timestamp for throttling mouse-position samples."""
+        if hasattr(event, "timestamp"):
+            return int(event.timestamp())
+        return int(monotonic() * 1000)
 
     def flush_pending_click(self) -> None:
         """Commit the delayed single-click once the double-click window expires."""

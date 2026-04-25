@@ -12,7 +12,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, List, Optional
 
-from annotator.research.models import ResearchEvent
+from annotator.research.models import MousePositionEvent, ResearchEvent
 
 
 def _utc_now_iso() -> str:
@@ -106,4 +106,62 @@ class ResearchExperimentTracker:
             "is_hidden": bool(self.is_hidden),
             "event_count": len(self.events),
             "events": [event.to_dict() for event in self.events],
+        }
+
+
+@dataclass
+class ResearchMousePositionTracker:
+    """In-memory representation of sampled research mouse-position telemetry."""
+
+    frame_dir: Optional[str] = None
+    started_at: Optional[str] = None
+    positions: List[MousePositionEvent] = field(default_factory=list)
+
+    def start_new(self, frame_dir: Path, started_at: Optional[str]) -> None:
+        """Start a fresh mouse-position log for the loaded frame directory."""
+        self.frame_dir = str(frame_dir)
+        self.started_at = started_at
+        self.positions = []
+
+    def load(
+        self,
+        data: Dict[str, Any],
+        *,
+        default_frame_dir: Optional[Path] = None,
+        default_started_at: Optional[str] = None,
+    ) -> None:
+        """Restore sampled mouse positions from persisted JSON data."""
+        self.frame_dir = str(data.get("frame_dir") or (str(default_frame_dir) if default_frame_dir else ""))
+        self.started_at = data.get("started_at") or default_started_at
+        raw_positions = data.get("positions", [])
+        self.positions = [
+            MousePositionEvent.from_dict(position)
+            for position in raw_positions
+            if isinstance(position, dict)
+        ]
+
+    def record_position(
+        self,
+        position: MousePositionEvent,
+        *,
+        elapsed_ms: int,
+    ) -> None:
+        """Append one sampled position with derived sequence and timing fields."""
+        entry = MousePositionEvent.from_dict(position.to_dict())
+        entry.event_index = len(self.positions) + 1
+        if entry.timestamp_iso is None:
+            entry.timestamp_iso = _utc_now_iso()
+        if entry.elapsed_ms is None:
+            entry.elapsed_ms = int(elapsed_ms)
+        self.positions.append(entry)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the mouse-position tracker into its independent file schema."""
+        return {
+            "version": 1,
+            "enabled": True,
+            "frame_dir": self.frame_dir,
+            "started_at": self.started_at,
+            "position_count": len(self.positions),
+            "positions": [position.to_dict() for position in self.positions],
         }

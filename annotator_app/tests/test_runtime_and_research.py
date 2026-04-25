@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,12 +14,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 try:
-    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtCore import QEvent, QPointF, Qt
     from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
 
     HAVE_PYSIDE6 = True
 except ModuleNotFoundError:
     QEvent = None
+    QPointF = None
     Qt = None
     QApplication = None
     QLabel = None
@@ -28,17 +30,18 @@ except ModuleNotFoundError:
 
 from annotator.propagation.runtime import PrefetchState, PropagationRuntimeState, SamTaskContext
 from annotator.research.experiment import ResearchExperimentTracker
-from annotator.research.models import CanvasContext, ResearchEvent
+from annotator.research.models import CanvasContext, MousePositionEvent, ResearchEvent
 
 if HAVE_PYSIDE6:
     from annotator.research.controller import ResearchController
 
 
 class FakeMouseEvent:
-    def __init__(self, event_type, timestamp: int, button=None) -> None:
+    def __init__(self, event_type, timestamp: int, button=None, x: float = 0.0, y: float = 0.0) -> None:
         self._event_type = event_type
         self._timestamp = timestamp
         self._button = Qt.LeftButton if button is None and HAVE_PYSIDE6 else button
+        self._position = QPointF(x, y) if HAVE_PYSIDE6 else None
 
     def type(self):
         return self._event_type
@@ -49,8 +52,36 @@ class FakeMouseEvent:
     def timestamp(self):
         return self._timestamp
 
+    def position(self):
+        return self._position
+
 
 class RuntimeStateTests(unittest.TestCase):
+    def test_mouse_position_event_round_trip(self) -> None:
+        event = MousePositionEvent(
+            frame_idx=5,
+            target_type="button",
+            target_name="Segment",
+            widget_class="QPushButton",
+            window_x_px=100,
+            window_y_px=110,
+            widget_x_px=12,
+            widget_y_px=14,
+            canvas_x_px=50,
+            canvas_y_px=60,
+            event_index=3,
+            timestamp_iso="2026-04-25T12:00:00+00:00",
+            elapsed_ms=1234,
+        )
+
+        restored = MousePositionEvent.from_dict(event.to_dict())
+
+        self.assertEqual(restored.target_name, "Segment")
+        self.assertEqual(restored.window_x_px, 100)
+        self.assertEqual(restored.widget_y_px, 14)
+        self.assertEqual(restored.canvas_x_px, 50)
+        self.assertEqual(restored.event_index, 3)
+
     def test_sam_task_context_version_alias_maps_to_cache_generation(self) -> None:
         context = SamTaskContext(kind="prefetch", cache_generation=3)
 
@@ -190,6 +221,75 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(canvas_event.target_name, "canvas_double_click")
         self.assertEqual(canvas_event.canvas_context.gesture_kind, "double_click")
         self.assertEqual(canvas_event.canvas_context.active_object_id, 9)
+
+    def test_research_controller_samples_mouse_positions_to_independent_tracker(self) -> None:
+        parent = QWidget()
+        controller = ResearchController(parent, enabled=True)
+        controller.start_new(Path("D:/frames"), start_paused=False)
+
+        button = QPushButton("Segment", parent)
+        first_move = FakeMouseEvent(QEvent.MouseMove, timestamp=1000, x=12, y=14)
+        skipped_move = FakeMouseEvent(QEvent.MouseMove, timestamp=1100, x=13, y=15)
+        later_move = FakeMouseEvent(QEvent.MouseMove, timestamp=1250, x=20, y=22)
+
+        controller.record_mouse_position(
+            watched=button,
+            event=first_move,
+            current_frame_idx=2,
+            has_frames=True,
+        )
+        controller.record_mouse_position(
+            watched=button,
+            event=skipped_move,
+            current_frame_idx=2,
+            has_frames=True,
+        )
+        controller.record_mouse_position(
+            watched=button,
+            event=later_move,
+            current_frame_idx=2,
+            has_frames=True,
+        )
+
+        self.assertEqual(len(controller.tracker.events), 0)
+        self.assertEqual(len(controller.mouse_tracker.positions), 2)
+        first_position = controller.mouse_tracker.positions[0]
+        self.assertEqual(first_position.target_type, "button")
+        self.assertEqual(first_position.target_name, "Segment")
+        self.assertEqual(first_position.widget_x_px, 12)
+        self.assertEqual(first_position.widget_y_px, 14)
+        self.assertEqual(first_position.event_index, 1)
+
+    def test_research_controller_saves_mouse_positions_separately(self) -> None:
+        parent = QWidget()
+        controller = ResearchController(parent, enabled=True)
+        controller.start_new(Path("D:/frames"), start_paused=False)
+        image_label = QLabel(parent)
+
+        controller.record_mouse_position(
+            watched=image_label,
+            event=FakeMouseEvent(QEvent.MouseMove, timestamp=2000, x=5, y=6),
+            current_frame_idx=4,
+            has_frames=True,
+            canvas_xy=(55, 66),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir)
+            controller.save_session(session_dir, image_dir=Path("D:/frames"))
+
+            self.assertTrue((session_dir / "research.json").exists())
+            mouse_path = session_dir / "research_mouse_positions.json"
+            self.assertTrue(mouse_path.exists())
+
+            restored = ResearchController(QWidget(), enabled=True)
+            restored.load_session(session_dir, frame_dir=Path("D:/frames"))
+
+        self.assertEqual(len(restored.tracker.events), 0)
+        self.assertEqual(len(restored.mouse_tracker.positions), 1)
+        position = restored.mouse_tracker.positions[0]
+        self.assertEqual(position.canvas_x_px, 55)
+        self.assertEqual(position.canvas_y_px, 66)
 
 
 if __name__ == "__main__":

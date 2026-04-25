@@ -226,6 +226,17 @@ class AnnotatorMainWindow(QMainWindow):
                 has_frames=bool(self.frame_paths),
                 image_label=self.image_label,
             )
+            canvas_xy = None
+            if watched is self.image_label and event.type() == QEvent.MouseMove and hasattr(event, "position"):
+                position = event.position()
+                canvas_xy = self._map_ui_to_image_xy(position.x(), position.y())
+            self._research_controller.record_mouse_position(
+                watched=watched,
+                event=event,
+                current_frame_idx=self.current_frame_idx,
+                has_frames=bool(self.frame_paths),
+                canvas_xy=canvas_xy,
+            )
         if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape):
             handled = super().eventFilter(watched, event)
             QTimer.singleShot(0, self._focus_canvas)
@@ -553,32 +564,96 @@ class AnnotatorMainWindow(QMainWindow):
         self._install_focus_return_widgets()
         self._sync_propagation_mode_controls()
         self._build_status_bar()
+        if self._research_mode_enabled:
+            self._enable_research_mouse_tracking(self)
+
+    def _enable_research_mouse_tracking(self, root: QWidget) -> None:
+        """Enable passive mouse-move events for research whole-window position logging."""
+        root.setMouseTracking(True)
+        for child in root.findChildren(QWidget):
+            child.setMouseTracking(True)
 
     def _build_menu(self) -> None:
-        """Create top-level actions that are always available in the menu bar."""
-        load_action = QAction("Load Frame Directory", self)
+        """Create the application menu bar with grouped workflow actions."""
+        menu_bar = self.menuBar()
+
+        file_menu = menu_bar.addMenu("File")
+        load_action = QAction("Load Frame Directory...", self)
         load_action.triggered.connect(self.load_frame_directory)
-        self.menuBar().addAction(load_action)
-
-        export_action = QAction("Export Annotations", self)
-        export_action.triggered.connect(self.export_annotations)
-        self.menuBar().addAction(export_action)
-
-        save_action = QAction("Save Session", self)
-        save_action.triggered.connect(self.save_session_dialog)
-        self.menuBar().addAction(save_action)
-
-        load_session_action = QAction("Load Session", self)
+        file_menu.addAction(load_action)
+        load_session_action = QAction("Load Session...", self)
         load_session_action.triggered.connect(self.load_session_dialog)
-        self.menuBar().addAction(load_session_action)
+        file_menu.addAction(load_session_action)
+        save_action = QAction("Save Session...", self)
+        save_action.triggered.connect(self.save_session_dialog)
+        file_menu.addAction(save_action)
+        file_menu.addSeparator()
+        export_action = QAction("Export Annotations...", self)
+        export_action.triggered.connect(self.export_annotations)
+        file_menu.addAction(export_action)
+        file_menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
-        help_menu = self.menuBar().addMenu("Help")
+        edit_menu = menu_bar.addMenu("Edit")
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.Undo)
+        undo_action.triggered.connect(self.undo_last_prompt_change)
+        edit_menu.addAction(undo_action)
+        delete_prompt_action = QAction("Delete Selected Prompt/Box", self)
+        delete_prompt_action.setShortcut(QKeySequence(Qt.Key_Delete))
+        delete_prompt_action.triggered.connect(self._delete_current_prompt_shortcut)
+        edit_menu.addAction(delete_prompt_action)
+
+        view_menu = menu_bar.addMenu("View")
+        fit_action = QAction("Fit to Screen", self)
+        fit_action.triggered.connect(self.fit_current_frame_to_view)
+        view_menu.addAction(fit_action)
+
+        navigate_menu = menu_bar.addMenu("Navigate")
+        prev_frame_action = QAction("Previous Frame", self)
+        prev_frame_action.setShortcut(QKeySequence(Qt.Key_Left))
+        prev_frame_action.triggered.connect(self.go_prev_frame)
+        navigate_menu.addAction(prev_frame_action)
+        next_frame_action = QAction("Next Frame", self)
+        next_frame_action.setShortcut(QKeySequence(Qt.Key_Right))
+        next_frame_action.triggered.connect(self.go_next_frame_shortcut)
+        navigate_menu.addAction(next_frame_action)
+        navigate_menu.addSeparator()
+        toggle_flag_action = QAction("Flag / Unflag Current Frame", self)
+        toggle_flag_action.setShortcut(QKeySequence("F"))
+        toggle_flag_action.triggered.connect(self.toggle_current_frame_flag)
+        navigate_menu.addAction(toggle_flag_action)
+        prev_flag_action = QAction("Previous Flagged Frame", self)
+        prev_flag_action.setShortcut(QKeySequence("Shift+Left"))
+        prev_flag_action.triggered.connect(self.go_prev_flagged_frame)
+        navigate_menu.addAction(prev_flag_action)
+        next_flag_action = QAction("Next Flagged Frame", self)
+        next_flag_action.setShortcut(QKeySequence("Shift+Right"))
+        next_flag_action.triggered.connect(self.go_next_flagged_frame)
+        navigate_menu.addAction(next_flag_action)
+
+        tools_menu = menu_bar.addMenu("Tools")
+        segment_action = QAction("Segment Current Frame", self)
+        segment_action.triggered.connect(self.segment_current_frame)
+        tools_menu.addAction(segment_action)
+        propagate_action = QAction("Propagate", self)
+        propagate_action.setShortcut(QKeySequence("P"))
+        propagate_action.triggered.connect(self.propagate_next_frame)
+        tools_menu.addAction(propagate_action)
+
+        help_menu = menu_bar.addMenu("Help")
         hotkeys_action = QAction("Hotkeys List", self)
         hotkeys_action.triggered.connect(self.show_hotkeys_list)
         help_menu.addAction(hotkeys_action)
-        walkthrough_action = QAction("Instructions / Walkthrough", self)
+        walkthrough_action = QAction("Program Explanation", self)
         walkthrough_action.triggered.connect(self.show_instructions_walkthrough)
         help_menu.addAction(walkthrough_action)
+        help_menu.addSeparator()
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
 
     def _build_left_review_panel(self) -> QWidget:
         """Build the flagged-frame review panel shown on the left side."""
@@ -1436,6 +1511,21 @@ class AnnotatorMainWindow(QMainWindow):
             ),
         )
 
+    def show_about_dialog(self) -> None:
+        """Show a concise app-purpose dialog from the Help menu."""
+        QMessageBox.about(
+            self,
+            "About SAM3 Annotator",
+            "\n".join(
+                [
+                    "SAM3 Annotator",
+                    "",
+                    "Interactive surgical video annotation tool using SAM3-assisted prompting, "
+                    "segmentation, propagation, review flags, session persistence, and export workflows.",
+                ]
+            ),
+        )
+
     def _flagged_frame_display_text(self, frame_idx: int) -> str:
         """Build the list-row label for one flagged frame."""
         label = f"Frame {frame_idx + 1}"
@@ -1834,6 +1924,8 @@ class AnnotatorMainWindow(QMainWindow):
             "solo_btn": solo_btn,
             "hide_btn": hide_btn,
         }
+        if self._research_mode_enabled:
+            self._enable_research_mouse_tracking(row_widget)
         return row_widget
 
     def _is_object_visible(self, obj_id: int) -> bool:
