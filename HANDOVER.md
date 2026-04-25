@@ -318,3 +318,4 @@ Before edits, summarize current behavior and your exact implementation plan.
 | 2026-04-05 | Changed object-row `Prop` toggles to frame-local state: unlabeled frames show unchecked/disabled, labeled frames auto-check from current-frame seed data, and manual unchecks persist only on that frame |
 | 2026-04-05 | Exposed tracker-side object score as a second per-frame score channel in app outputs, object-row UI, and session save/load without changing export score semantics |
 | 2026-04-05 | Added experimental `Use One Session for Chunked Propagation` mode that reuses one full-video SAM3 session across chunks within a propagation run |
+Note: the annotator-owned application code has moved to `D:\SAM3Annotator\annotator_app`. Historical paths below that point at `sam3v2/surgical_annotator_qt.py` or `sam3v2/tools/...` describe the old layout unless explicitly updated.

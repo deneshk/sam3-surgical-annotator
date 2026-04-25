@@ -1,42 +1,28 @@
-# SAM3 Surgical Annotator
+# Vendored SAM3 Runtime
 
-`sam3-surgical-annotator` is a SAM3-based desktop annotation tool for surgical video frame sequences. It provides per-object prompts, segmentation, frame-to-frame propagation, and COCO-style export with mask PNGs.
+This directory now serves as the vendored SAM3 runtime tree used by the surgical annotator application. The annotator-owned app code has been moved out to the sibling `annotator_app` directory so this tree can stay closer to upstream ownership boundaries.
 
 ## Project Status
 
-This repository is a derivative project built on top of Meta's SAM3 codebase. The surgical annotator application and related exporter/docs live in:
+The surgical annotator application now lives in `../annotator_app`. This directory keeps the upstream-style SAM3 source tree because the annotator depends on the local SAM3 runtime.
 
-- `surgical_annotator_qt.py`
-- `tools/exporters/coco_export.py`
-- `tools/README_surgical_annotator.md`
+## Annotator Integration
 
-The repository keeps the upstream SAM3 source tree because the annotator depends on the local SAM3 runtime.
-
-## Key Features
-
-- Load a directory of image frames as a sequence
-- Create stable object IDs with per-object propagation enable/disable
-- Add positive points, negative points, and draggable box prompts
-- Run single-frame segmentation for prompted objects
-- Run chunked forward propagation/tracking across frames
-- Export COCO-style JSON with per-object mask PNG files
-
-## Surgical Annotator
-
-Install the annotator dependencies from the repository root:
+Install the SAM3 runtime dependencies from this directory:
 
 ```bash
-python3 -m pip install -r requirements-annotator.txt
 python3 -m pip install -e .
 ```
 
-Run the desktop app:
+Then install and run the annotator from `../annotator_app`:
 
 ```bash
-python3 surgical_annotator_qt.py
+cd ../annotator_app
+python3 -m pip install -e .
+python3 run_annotator.py
 ```
 
-Detailed app usage is documented in `tools/README_surgical_annotator.md`.
+Detailed app usage is documented in `../annotator_app/docs/README_surgical_annotator.md`.
 
 ## Relationship to Upstream SAM3
 
@@ -50,5 +36,5 @@ Any redistribution of the included SAM3 materials and derivative works remains s
 ## Notes
 
 - A working SAM3 environment is still required for inference.
-- Checkpoint/BPE resolution follows the behavior implemented in the local SAM3 code and annotator UI.
-- This repository is focused on surgical annotation workflows rather than being a clean fork of upstream documentation.
+- Checkpoint/BPE resolution follows the behavior implemented in the vendored SAM3 code and annotator UI.
+- This directory is no longer the home of the annotator application itself.
