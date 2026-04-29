@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image as PilImage
 from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, Signal, QEvent, QEventLoop, QMetaObject, QTimer
 from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
@@ -51,6 +50,7 @@ from annotator.exporters.coco_export import SamFrameOutput as ExportSamFrameOutp
 from annotator.exporters.perk_export import BoxPrompt as ExportPerkBoxPrompt
 from annotator.exporters.perk_export import ObjectInfo as ExportPerkObjectInfo
 from annotator.exporters.perk_export import PerkExporter
+from annotator.frame_io import FrameIoCache
 from annotator.models import (
     BoxPrompt,
     DEFAULT_BOX_LINE_THICKNESS,
@@ -159,6 +159,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._output_version_by_frame: Dict[int, int] = {}
         self._undo_state: Optional[dict] = None
         self._last_prompt_edit_frame: Optional[int] = None
+        self._frame_io_cache = FrameIoCache()
         self._session_dir: Optional[Path] = None
         self._autosave_timer = QTimer(self)
         self._autosave_timer.timeout.connect(self._handle_autosave)
@@ -2024,6 +2025,8 @@ class AnnotatorMainWindow(QMainWindow):
 
         self.image_dir = dir_path
         self.frame_paths = frame_paths
+        self._clear_frame_io_caches()
+        self._prime_frame_size_cache()
         self.current_frame_idx = 0
         self.objects.clear()
         self.object_list.clear()
@@ -3764,6 +3767,7 @@ class AnnotatorMainWindow(QMainWindow):
         update_progress(28, "Preparing frame directory...")
         self.image_dir = frame_dir
         self.frame_paths = [frame_dir / name for name in frame_files]
+        self._clear_frame_io_caches()
         self.segment_mode = False
         self.mode_label.setText("Mode: Box Annotation")
         self._clear_pending_propagation_state()
@@ -4604,34 +4608,21 @@ class AnnotatorMainWindow(QMainWindow):
         """Return the current frame size as ``(width, height)`` pixels."""
         return self._get_frame_size(self.current_frame_idx)
 
+    def _clear_frame_io_caches(self) -> None:
+        """Drop frame metadata and decoded-image caches for the active directory."""
+        self._frame_io_cache.clear()
+
+    def _prime_frame_size_cache(self) -> None:
+        """Read frame dimensions in parallel after a fresh directory load."""
+        self._frame_io_cache.prime_frame_sizes(self.frame_paths)
+
     def _get_frame_size(self, frame_idx: int) -> Optional[Tuple[int, int]]:
-        """Read width and height for one frame using OpenCV with a PIL fallback."""
-        if not self.frame_paths or frame_idx < 0 or frame_idx >= len(self.frame_paths):
-            return None
-        frame = cv2.imread(str(self.frame_paths[frame_idx]))
-        if frame is not None:
-            h, w = frame.shape[:2]
-            return w, h
-        try:
-            with PilImage.open(str(self.frame_paths[frame_idx])) as img:
-                w, h = img.size
-            return w, h
-        except Exception:
-            return None
+        """Return width and height for one frame using cached metadata when available."""
+        return self._frame_io_cache.get_frame_size(self.frame_paths, frame_idx)
 
     def _read_frame_bgr(self, frame_idx: int) -> Optional[np.ndarray]:
         """Read one frame as a BGR array using OpenCV with a PIL fallback."""
-        if not self.frame_paths or frame_idx < 0 or frame_idx >= len(self.frame_paths):
-            return None
-        frame = cv2.imread(str(self.frame_paths[frame_idx]))
-        if frame is not None:
-            return frame
-        try:
-            with PilImage.open(str(self.frame_paths[frame_idx])) as img:
-                rgb = img.convert("RGB")
-            return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
-        except Exception:
-            return None
+        return self._frame_io_cache.read_frame_bgr(self.frame_paths, frame_idx)
 
     def _color_for_obj(self, obj_id: int) -> Tuple[int, int, int]:
         """Choose a repeatable display color for an object from the fixed palette."""
