@@ -31,7 +31,7 @@ The app loads a directory of image frames and treats it as a video sequence. Use
 
 Core user-facing workflows:
 
-- Load a frame directory and browse frames with slider, jump control, hotkeys, zoom, and pan.
+- Load a frame directory and browse frames with slider, jump control, hotkeys, play/pause preview, zoom, and pan.
 - Create objects with stable `obj_id`s, per-object colors, inline row controls, and frame-local propagation enablement.
 - Annotate boxes directly on the canvas, including move and resize via drag handles.
 - Add positive or negative point prompts on the active object.
@@ -60,6 +60,17 @@ Rule of thumb for future work:
 
 - If the task is app behavior, start in `annotator_app/`.
 - Only edit `sam3/` when the app/runtime integration truly requires it.
+
+## Current UI And Loading Notes
+
+Frame-directory loading currently stores a sorted list of image paths, not decoded images. Frames are decoded on demand for rendering or frame-size queries through `main_window.py` helpers.
+
+Important recent history:
+
+- Video preview playback is part of `main`: the navigation row has Play/Pause plus configurable FPS.
+- PR #2 attempted eager parallel image metadata caching for faster directory loading, but it made large directory loads appear to hang and was reverted by PR #3. Avoid blocking directory load on all-frame metadata or all-image preload work.
+- Shortcut ownership is centralized in `_setup_shortcuts()`. Menu actions should remain clickable but should not register duplicate global shortcuts. Left/Right and Shift+Left/Shift+Right are owned by the window-level shortcut setup.
+- The frame slider should not accept keyboard focus, and Up/Down should not move frames through the frame-jump control.
 
 ## Core State Model
 
@@ -146,8 +157,47 @@ Coverage is focused on:
 - session persistence
 - runtime state records
 - research telemetry helpers
+- shortcut ownership/static UI regressions
 
 Some research/controller tests skip automatically when `PySide6` is unavailable.
+
+## Git Workflow
+
+Use `main` as the stable integration branch. Do not develop new features directly on historical or experimental branches.
+
+Recommended feature workflow:
+
+```powershell
+git switch main
+git pull origin main
+git switch -c feature/<short-description>
+```
+
+For fixes or maintenance:
+
+```powershell
+git switch -c fix/<short-description>
+git switch -c chore/<short-description>
+```
+
+Branch naming conventions:
+
+- `feature/...`: user-facing capability or workflow improvement
+- `fix/...`: bug fix or regression fix
+- `chore/...`: maintenance, repo hygiene, or non-user-facing cleanup
+- `experiment/...`: exploratory work that should not be merged wholesale without review
+- `revert/...`: targeted revert branch when undoing a merged PR
+
+Default collaboration flow:
+
+1. Start from updated `main`.
+2. Make focused changes in app-owned files first.
+3. Run relevant validation, usually `python -m unittest discover annotator_app\tests`.
+4. Push the feature branch to `origin`.
+5. Open a GitHub PR into `main`.
+6. Leave the PR open for manual review unless explicitly asked to merge.
+
+Prefer reverting merged work with a revert commit or revert PR rather than rewriting `main` history.
 
 ## Source-Of-Truth Guidance
 
@@ -207,12 +257,20 @@ Working assumptions:
 - main_window.py is still the orchestration hub
 - canonical boxes and SAM outputs are separate state layers
 - session schema version is 6
+- fresh directory loading stores image paths and decodes frames lazily
+- shortcut bindings should have one owner in _setup_shortcuts()
 - code and tests beat older docs when they disagree
 
 Before editing:
 - summarize the affected workflow
 - identify the exact files you will touch
 - state how you will validate the change
+
+Git workflow:
+- start new work from updated main
+- create a focused feature/fix/chore branch
+- push to origin and open a PR into main for manual review
+- do not merge PRs unless explicitly asked
 
 Validation defaults:
 - run python -m unittest discover annotator_app\tests when relevant
