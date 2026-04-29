@@ -69,6 +69,7 @@ from annotator.models import (
 )
 from annotator.persistence.session_models import SessionPayload
 from annotator.persistence.session_repository import SessionRepository
+from annotator.postprocessing.masks import MaskPostProcessingSettings, process_frame_output
 from annotator.propagation.runtime import (
     PrefetchState,
     PropagationRuntimeState,
@@ -134,6 +135,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_prompts_by_frame_obj: Dict[int, Dict[int, BoxPrompt]] = {}
         self.box_locked_by_frame_obj: Dict[int, Dict[int, bool]] = {}
         self.outputs_by_frame: Dict[int, SamFrameOutput] = {}
+        self._raw_outputs_by_frame: Dict[int, SamFrameOutput] = {}
         self.manual_propagation_overrides_by_frame_obj: Dict[int, Dict[int, bool]] = {}
         self._active_prompt_rows: List[Tuple[str, int]] = []
 
@@ -182,6 +184,16 @@ class AnnotatorMainWindow(QMainWindow):
         self.use_target_frame: bool = False
         self.segmentation_opacity: float = DEFAULT_SEGMENTATION_OPACITY
         self.box_line_thickness: int = DEFAULT_BOX_LINE_THICKNESS
+        self.postprocessing_enabled: bool = False
+        self.postprocess_remove_small_components: bool = True
+        self.postprocess_min_component_area_px: int = 50
+        self.postprocess_fill_holes: bool = False
+        self.postprocess_max_hole_area_px: int = 100
+        self.postprocess_morph_open: bool = False
+        self.postprocess_morph_close: bool = False
+        self.postprocess_morph_kernel_size: int = 3
+        self.postprocess_simplify_contours: bool = False
+        self.postprocess_simplify_epsilon_fraction: float = 0.002
         self._research_mode_enabled: bool = bool(research_mode_enabled)
         self._research_controller = ResearchController(self, enabled=self._research_mode_enabled)
 
@@ -669,6 +681,7 @@ class AnnotatorMainWindow(QMainWindow):
         right_layout.addWidget(control_tabs)
         control_tabs.addTab(self._build_prompt_tab(), "Prompting")
         control_tabs.addTab(self._build_processing_tab(), "Segment / Propagate")
+        control_tabs.addTab(self._build_postprocessing_tab(), "Postprocessing")
         return right_panel
 
     def _build_prompt_tab(self) -> QWidget:
@@ -868,6 +881,84 @@ class AnnotatorMainWindow(QMainWindow):
         processing_layout.addStretch(1)
         return processing_tab
 
+    def _build_postprocessing_tab(self) -> QWidget:
+        """Build experimental mask post-processing controls."""
+        postprocessing_tab = QWidget()
+        layout = QVBoxLayout(postprocessing_tab)
+
+        self.postprocessing_enabled_check = QCheckBox("Enable Mask Post-processing")
+        self.postprocessing_enabled_check.setChecked(self.postprocessing_enabled)
+        self.postprocessing_enabled_check.toggled.connect(self._on_postprocessing_settings_changed)
+        layout.addWidget(self.postprocessing_enabled_check)
+
+        self.postprocess_remove_small_components_check = QCheckBox("Remove Small Components")
+        self.postprocess_remove_small_components_check.setChecked(self.postprocess_remove_small_components)
+        self.postprocess_remove_small_components_check.toggled.connect(self._on_postprocessing_settings_changed)
+        layout.addWidget(self.postprocess_remove_small_components_check)
+
+        component_form = QFormLayout()
+        self.postprocess_min_component_area_spin = QSpinBox()
+        self.postprocess_min_component_area_spin.setMinimum(1)
+        self.postprocess_min_component_area_spin.setMaximum(1000000)
+        self.postprocess_min_component_area_spin.setValue(self.postprocess_min_component_area_px)
+        self.postprocess_min_component_area_spin.valueChanged.connect(self._on_postprocessing_settings_changed)
+        component_form.addRow("Minimum component area (px)", self.postprocess_min_component_area_spin)
+        layout.addLayout(component_form)
+
+        self.postprocess_fill_holes_check = QCheckBox("Fill Small Holes")
+        self.postprocess_fill_holes_check.setChecked(self.postprocess_fill_holes)
+        self.postprocess_fill_holes_check.toggled.connect(self._on_postprocessing_settings_changed)
+        layout.addWidget(self.postprocess_fill_holes_check)
+
+        hole_form = QFormLayout()
+        self.postprocess_max_hole_area_spin = QSpinBox()
+        self.postprocess_max_hole_area_spin.setMinimum(1)
+        self.postprocess_max_hole_area_spin.setMaximum(1000000)
+        self.postprocess_max_hole_area_spin.setValue(self.postprocess_max_hole_area_px)
+        self.postprocess_max_hole_area_spin.valueChanged.connect(self._on_postprocessing_settings_changed)
+        hole_form.addRow("Maximum hole area (px)", self.postprocess_max_hole_area_spin)
+        layout.addLayout(hole_form)
+
+        self.postprocess_morph_open_check = QCheckBox("Morphological Open")
+        self.postprocess_morph_open_check.setChecked(self.postprocess_morph_open)
+        self.postprocess_morph_open_check.toggled.connect(self._on_postprocessing_settings_changed)
+        layout.addWidget(self.postprocess_morph_open_check)
+
+        self.postprocess_morph_close_check = QCheckBox("Morphological Close")
+        self.postprocess_morph_close_check.setChecked(self.postprocess_morph_close)
+        self.postprocess_morph_close_check.toggled.connect(self._on_postprocessing_settings_changed)
+        layout.addWidget(self.postprocess_morph_close_check)
+
+        morph_form = QFormLayout()
+        self.postprocess_morph_kernel_spin = QSpinBox()
+        self.postprocess_morph_kernel_spin.setMinimum(1)
+        self.postprocess_morph_kernel_spin.setMaximum(31)
+        self.postprocess_morph_kernel_spin.setSingleStep(2)
+        self.postprocess_morph_kernel_spin.setValue(self.postprocess_morph_kernel_size)
+        self.postprocess_morph_kernel_spin.valueChanged.connect(self._on_postprocessing_settings_changed)
+        morph_form.addRow("Morphology kernel size", self.postprocess_morph_kernel_spin)
+        layout.addLayout(morph_form)
+
+        self.postprocess_simplify_contours_check = QCheckBox("Simplify Contours")
+        self.postprocess_simplify_contours_check.setChecked(self.postprocess_simplify_contours)
+        self.postprocess_simplify_contours_check.toggled.connect(self._on_postprocessing_settings_changed)
+        layout.addWidget(self.postprocess_simplify_contours_check)
+
+        simplify_form = QFormLayout()
+        self.postprocess_simplify_epsilon_spin = QDoubleSpinBox()
+        self.postprocess_simplify_epsilon_spin.setMinimum(0.0005)
+        self.postprocess_simplify_epsilon_spin.setMaximum(0.02)
+        self.postprocess_simplify_epsilon_spin.setSingleStep(0.0005)
+        self.postprocess_simplify_epsilon_spin.setDecimals(4)
+        self.postprocess_simplify_epsilon_spin.setValue(self.postprocess_simplify_epsilon_fraction)
+        self.postprocess_simplify_epsilon_spin.valueChanged.connect(self._on_postprocessing_settings_changed)
+        simplify_form.addRow("Simplify epsilon fraction", self.postprocess_simplify_epsilon_spin)
+        layout.addLayout(simplify_form)
+
+        self._sync_postprocessing_controls()
+        layout.addStretch(1)
+        return postprocessing_tab
+
     def _register_advanced_widgets(self) -> None:
         """Track widgets that can be globally shown or hidden as advanced controls."""
         self._advanced_widgets = [
@@ -908,6 +999,10 @@ class AnnotatorMainWindow(QMainWindow):
             self.autosave_minutes_spin,
             self.segmentation_opacity_spin,
             self.box_line_thickness_spin,
+            self.postprocess_min_component_area_spin,
+            self.postprocess_max_hole_area_spin,
+            self.postprocess_morph_kernel_spin,
+            self.postprocess_simplify_epsilon_spin,
             self.chunk_size_spin,
             self.chunks_spin,
             self.target_frame_spin,
@@ -1427,6 +1522,124 @@ class AnnotatorMainWindow(QMainWindow):
         self.show_box_titles = self.show_box_titles_check.isChecked()
         self.segmentation_opacity = float(self.segmentation_opacity_spin.value())
         self.box_line_thickness = int(self.box_line_thickness_spin.value())
+        self._render_current_frame()
+
+    def _on_postprocessing_settings_changed(self, _value=None) -> None:
+        """Pull experimental mask post-processing settings from widgets."""
+        self.postprocessing_enabled = self.postprocessing_enabled_check.isChecked()
+        self.postprocess_remove_small_components = self.postprocess_remove_small_components_check.isChecked()
+        self.postprocess_min_component_area_px = int(self.postprocess_min_component_area_spin.value())
+        self.postprocess_fill_holes = self.postprocess_fill_holes_check.isChecked()
+        self.postprocess_max_hole_area_px = int(self.postprocess_max_hole_area_spin.value())
+        self.postprocess_morph_open = self.postprocess_morph_open_check.isChecked()
+        self.postprocess_morph_close = self.postprocess_morph_close_check.isChecked()
+        self.postprocess_simplify_contours = self.postprocess_simplify_contours_check.isChecked()
+        self.postprocess_simplify_epsilon_fraction = float(self.postprocess_simplify_epsilon_spin.value())
+        kernel_size = int(self.postprocess_morph_kernel_spin.value())
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+            self.postprocess_morph_kernel_spin.blockSignals(True)
+            self.postprocess_morph_kernel_spin.setValue(kernel_size)
+            self.postprocess_morph_kernel_spin.blockSignals(False)
+        self.postprocess_morph_kernel_size = kernel_size
+        self._sync_postprocessing_controls()
+        self._reprocess_existing_outputs()
+
+    def _reset_postprocessing_settings(self) -> None:
+        """Reset non-persisted post-processing controls to their startup defaults."""
+        self.postprocessing_enabled = False
+        self.postprocess_remove_small_components = True
+        self.postprocess_min_component_area_px = 50
+        self.postprocess_fill_holes = False
+        self.postprocess_max_hole_area_px = 100
+        self.postprocess_morph_open = False
+        self.postprocess_morph_close = False
+        self.postprocess_morph_kernel_size = 3
+        self.postprocess_simplify_contours = False
+        self.postprocess_simplify_epsilon_fraction = 0.002
+        if not hasattr(self, "postprocessing_enabled_check"):
+            return
+        for widget, value in (
+            (self.postprocessing_enabled_check, self.postprocessing_enabled),
+            (self.postprocess_remove_small_components_check, self.postprocess_remove_small_components),
+            (self.postprocess_fill_holes_check, self.postprocess_fill_holes),
+            (self.postprocess_morph_open_check, self.postprocess_morph_open),
+            (self.postprocess_morph_close_check, self.postprocess_morph_close),
+            (self.postprocess_simplify_contours_check, self.postprocess_simplify_contours),
+        ):
+            widget.blockSignals(True)
+            widget.setChecked(value)
+            widget.blockSignals(False)
+        for widget, value in (
+            (self.postprocess_min_component_area_spin, self.postprocess_min_component_area_px),
+            (self.postprocess_max_hole_area_spin, self.postprocess_max_hole_area_px),
+            (self.postprocess_morph_kernel_spin, self.postprocess_morph_kernel_size),
+            (self.postprocess_simplify_epsilon_spin, self.postprocess_simplify_epsilon_fraction),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._sync_postprocessing_controls()
+
+    def _sync_postprocessing_controls(self) -> None:
+        """Enable child controls only when their post-processing stage can run."""
+        if not hasattr(self, "postprocessing_enabled_check"):
+            return
+        enabled = self.postprocessing_enabled_check.isEnabled() and self.postprocessing_enabled_check.isChecked()
+        remove_components = enabled and self.postprocess_remove_small_components_check.isChecked()
+        fill_holes = enabled and self.postprocess_fill_holes_check.isChecked()
+        morphology = enabled and (
+            self.postprocess_morph_open_check.isChecked()
+            or self.postprocess_morph_close_check.isChecked()
+        )
+        simplify = enabled and self.postprocess_simplify_contours_check.isChecked()
+        self.postprocess_remove_small_components_check.setEnabled(enabled)
+        self.postprocess_min_component_area_spin.setEnabled(remove_components)
+        self.postprocess_fill_holes_check.setEnabled(enabled)
+        self.postprocess_max_hole_area_spin.setEnabled(fill_holes)
+        self.postprocess_morph_open_check.setEnabled(enabled)
+        self.postprocess_morph_close_check.setEnabled(enabled)
+        self.postprocess_morph_kernel_spin.setEnabled(morphology)
+        self.postprocess_simplify_contours_check.setEnabled(enabled)
+        self.postprocess_simplify_epsilon_spin.setEnabled(simplify)
+
+    def _current_postprocessing_settings(self) -> MaskPostProcessingSettings:
+        """Capture current experimental mask post-processing settings."""
+        return MaskPostProcessingSettings(
+            enabled=bool(self.postprocessing_enabled),
+            remove_small_components=bool(self.postprocess_remove_small_components),
+            min_component_area_px=int(self.postprocess_min_component_area_px),
+            fill_holes=bool(self.postprocess_fill_holes),
+            max_hole_area_px=int(self.postprocess_max_hole_area_px),
+            morph_open=bool(self.postprocess_morph_open),
+            morph_close=bool(self.postprocess_morph_close),
+            morph_kernel_size=int(self.postprocess_morph_kernel_size),
+            simplify_contours=bool(self.postprocess_simplify_contours),
+            simplify_epsilon_fraction=float(self.postprocess_simplify_epsilon_fraction),
+        )
+
+    def _postprocess_frame_output(self, output: SamFrameOutput) -> SamFrameOutput:
+        """Apply enabled mask post-processing to a worker output."""
+        return process_frame_output(output, self._current_postprocessing_settings())
+
+    def _store_raw_frame_output(self, frame_idx: int, output: SamFrameOutput) -> None:
+        """Remember an unprocessed output for future post-processing setting changes."""
+        self._raw_outputs_by_frame[int(frame_idx)] = self._clone_frame_output(output) or output
+
+    def _reprocess_existing_outputs(self) -> None:
+        """Reapply current post-processing settings to all retained raw outputs."""
+        if not self._raw_outputs_by_frame:
+            return
+        self.outputs_by_frame = {
+            int(frame_idx): self._postprocess_frame_output(raw_output)
+            for frame_idx, raw_output in self._raw_outputs_by_frame.items()
+        }
+        self._output_version_by_frame = {
+            int(frame_idx): self._prefetch_prompt_version
+            for frame_idx in self.outputs_by_frame.keys()
+        }
+        for frame_idx, output in self.outputs_by_frame.items():
+            self._sync_canonical_boxes_from_output(frame_idx, output, preserve_locked=True)
         self._render_current_frame()
 
     def _current_view_settings(self) -> ViewSettings:
@@ -1973,6 +2186,8 @@ class AnnotatorMainWindow(QMainWindow):
         self.autosave_check.setEnabled(enabled)
         self.autosave_minutes_spin.setEnabled(enabled)
         self.propagation_mode_combo.setEnabled(enabled)
+        self.postprocessing_enabled_check.setEnabled(enabled)
+        self._sync_postprocessing_controls()
         running = propagation.busy
         pending = self._pending_propagation is not None
         self.stop_propagate_btn.setEnabled(running or pending)
@@ -2038,6 +2253,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_prompts_by_frame_obj.clear()
         self.box_locked_by_frame_obj.clear()
         self.outputs_by_frame.clear()
+        self._raw_outputs_by_frame.clear()
         self.manual_propagation_overrides_by_frame_obj.clear()
         self._output_version_by_frame.clear()
         self._prefetch_state.provenance_by_frame.clear()
@@ -3072,6 +3288,8 @@ class AnnotatorMainWindow(QMainWindow):
 
     def _handle_propagation_frame(self, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
         """Merge one emitted propagation frame into app state and refresh progress UI."""
+        self._store_raw_frame_output(abs_frame_idx, output)
+        output = self._postprocess_frame_output(output)
         existing_output = self.outputs_by_frame.get(
             abs_frame_idx,
             SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
@@ -3097,6 +3315,8 @@ class AnnotatorMainWindow(QMainWindow):
 
     def _on_sam_segment_done(self, task_id: str, frame_idx: int, composite: SamFrameOutput) -> None:
         """Merge finished segmentation results into frame state and wake any waiter."""
+        self._store_raw_frame_output(frame_idx, composite)
+        composite = self._postprocess_frame_output(composite)
         existing_output = self.outputs_by_frame.get(
             frame_idx,
             SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
@@ -3130,6 +3350,8 @@ class AnnotatorMainWindow(QMainWindow):
             target_frame_idx = context.get("target_frame_idx")
             if version != self._prefetch_prompt_version or abs_frame_idx != target_frame_idx:
                 return
+            self._store_raw_frame_output(abs_frame_idx, output)
+            output = self._postprocess_frame_output(output)
             existing_output = self.outputs_by_frame.get(
                 abs_frame_idx,
                 SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
@@ -3160,6 +3382,8 @@ class AnnotatorMainWindow(QMainWindow):
                 )
             return
 
+        self._store_raw_frame_output(abs_frame_idx, output)
+        output = self._postprocess_frame_output(output)
         existing_output = self.outputs_by_frame.get(
             abs_frame_idx,
             SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
@@ -3748,6 +3972,7 @@ class AnnotatorMainWindow(QMainWindow):
                 f"Reading saved outputs... {idx}/{total}",
             ),
         )
+        self._reset_postprocessing_settings()
         frame_dir = Path(payload.frame_dir)
         if not frame_dir.exists():
             alt_dir = QFileDialog.getExistingDirectory(self, "Select Frame Directory for Session")
@@ -3872,10 +4097,12 @@ class AnnotatorMainWindow(QMainWindow):
 
         update_progress(76, "Restoring masks and outputs...")
         self.outputs_by_frame = {}
+        self._raw_outputs_by_frame = {}
         self._output_version_by_frame.clear()
         for frame_idx, output in payload.outputs_by_frame.items():
             frame_idx_int = int(frame_idx)
             self.outputs_by_frame[frame_idx_int] = output
+            self._raw_outputs_by_frame[frame_idx_int] = self._clone_frame_output(output) or output
             self._output_version_by_frame[frame_idx_int] = self._prefetch_prompt_version
 
         if self.outputs_by_frame:
