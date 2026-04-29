@@ -68,7 +68,7 @@ python3 -m pip install -e .
 You also need a working SAM3 environment with PyTorch/CUDA compatible with your setup.
 
 ## Run
-From `sam3v2/`:
+From `annotator_app/`:
 
 ```bash
 python3 run_annotator.py

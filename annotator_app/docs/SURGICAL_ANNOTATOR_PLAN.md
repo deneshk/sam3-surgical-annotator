@@ -37,7 +37,7 @@ Build a new standalone PySide6 desktop application on top of `sam3.model.sam3_vi
   - COCO JSON + mask PNG export helpers.
 - `annotator_app/docs/README_surgical_annotator.md`
   - Setup/run instructions, expected checkpoint/auth behavior, shortcuts.
-- `sam3v2/requirements-annotator.txt`
+- `annotator_app/requirements-annotator.txt`
   - App-specific deps (PySide6, numpy, pillow, opencv-python, pycocotools optional).
 
 ## Runtime/Dependency Plan

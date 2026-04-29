@@ -17,7 +17,7 @@ def vendor_sam3_root() -> Path:
     override = os.getenv("SAM3_VENDOR_ROOT")
     if override:
         return Path(override).resolve()
-    return annotator_workspace_root() / "sam3v2"
+    return annotator_workspace_root() / "sam3"
 
 
 def ensure_vendor_sam3_on_path() -> Path:
