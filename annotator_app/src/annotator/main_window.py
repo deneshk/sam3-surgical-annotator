@@ -212,6 +212,14 @@ class AnnotatorMainWindow(QMainWindow):
                 has_frames=bool(self.frame_paths),
                 canvas_xy=canvas_xy,
             )
+        if (
+            event.type() == QEvent.KeyPress
+            and hasattr(self, "frame_jump_spin")
+            and watched is self.frame_jump_spin.spinBox()
+            and event.key() in (Qt.Key_Up, Qt.Key_Down)
+        ):
+            event.accept()
+            return True
         if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape):
             handled = super().eventFilter(watched, event)
             QTimer.singleShot(0, self._focus_canvas)
@@ -523,11 +531,9 @@ class AnnotatorMainWindow(QMainWindow):
 
         edit_menu = menu_bar.addMenu("Edit")
         undo_action = QAction("Undo", self)
-        undo_action.setShortcut(QKeySequence.Undo)
         undo_action.triggered.connect(self.undo_last_prompt_change)
         edit_menu.addAction(undo_action)
         delete_prompt_action = QAction("Delete Selected Prompt/Box", self)
-        delete_prompt_action.setShortcut(QKeySequence(Qt.Key_Delete))
         delete_prompt_action.triggered.connect(self._delete_current_prompt_shortcut)
         edit_menu.addAction(delete_prompt_action)
 
@@ -538,24 +544,19 @@ class AnnotatorMainWindow(QMainWindow):
 
         navigate_menu = menu_bar.addMenu("Navigate")
         prev_frame_action = QAction("Previous Frame", self)
-        prev_frame_action.setShortcut(QKeySequence(Qt.Key_Left))
         prev_frame_action.triggered.connect(self.go_prev_frame)
         navigate_menu.addAction(prev_frame_action)
         next_frame_action = QAction("Next Frame", self)
-        next_frame_action.setShortcut(QKeySequence(Qt.Key_Right))
         next_frame_action.triggered.connect(self.go_next_frame_shortcut)
         navigate_menu.addAction(next_frame_action)
         navigate_menu.addSeparator()
         toggle_flag_action = QAction("Flag / Unflag Current Frame", self)
-        toggle_flag_action.setShortcut(QKeySequence("F"))
         toggle_flag_action.triggered.connect(self.toggle_current_frame_flag)
         navigate_menu.addAction(toggle_flag_action)
         prev_flag_action = QAction("Previous Flagged Frame", self)
-        prev_flag_action.setShortcut(QKeySequence("Shift+Left"))
         prev_flag_action.triggered.connect(self.go_prev_flagged_frame)
         navigate_menu.addAction(prev_flag_action)
         next_flag_action = QAction("Next Flagged Frame", self)
-        next_flag_action.setShortcut(QKeySequence("Shift+Right"))
         next_flag_action.triggered.connect(self.go_next_flagged_frame)
         navigate_menu.addAction(next_flag_action)
 
@@ -564,7 +565,6 @@ class AnnotatorMainWindow(QMainWindow):
         segment_action.triggered.connect(self.segment_current_frame)
         tools_menu.addAction(segment_action)
         propagate_action = QAction("Propagate", self)
-        propagate_action.setShortcut(QKeySequence("P"))
         propagate_action.triggered.connect(self.propagate_next_frame)
         tools_menu.addAction(propagate_action)
 
@@ -621,6 +621,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.frame_slider.setMinimum(1)
         self.frame_slider.setMaximum(1)
         self.frame_slider.setValue(1)
+        self.frame_slider.setFocusPolicy(Qt.NoFocus)
         self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
         self.frame_slider.setMinimumHeight(34)
         self.frame_slider.setStyleSheet(
