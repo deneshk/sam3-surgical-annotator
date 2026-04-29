@@ -97,6 +97,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 WINDOW_SCREEN_FRACTION = 0.85
 CANVAS_SCREEN_FRACTION = (0.7, 0.6)
 CANVAS_SCREEN_MARGIN_PX = 40
+DEFAULT_PLAYBACK_FPS = 10
 DEFAULT_CHECKPOINT_OPTION_LABEL = "Use default HF checkpoint"
 CHECKPOINT_PRESET_OPTIONS: List[Tuple[str, Optional[str]]] = [
     (DEFAULT_CHECKPOINT_OPTION_LABEL, None),
@@ -161,6 +162,8 @@ class AnnotatorMainWindow(QMainWindow):
         self._session_dir: Optional[Path] = None
         self._autosave_timer = QTimer(self)
         self._autosave_timer.timeout.connect(self._handle_autosave)
+        self._playback_timer = QTimer(self)
+        self._playback_timer.timeout.connect(self._advance_playback_frame)
         self._box_draw_start_xy: Optional[Tuple[int, int]] = None
         self._box_draw_start_ui_xy: Optional[Tuple[int, int]] = None
         self._box_edit_active: bool = False
@@ -626,6 +629,16 @@ class AnnotatorMainWindow(QMainWindow):
             "QSlider::sub-page:horizontal { border-radius: 6px; background: #6aa3d9; }"
             "QSlider::add-page:horizontal { border-radius: 6px; background: #2a2a2a; }"
         )
+        self.playback_btn = QPushButton("Play")
+        self.playback_btn.setEnabled(False)
+        self.playback_btn.clicked.connect(self._toggle_playback)
+        self.playback_fps_spin = QSpinBox()
+        self.playback_fps_spin.setMinimum(1)
+        self.playback_fps_spin.setMaximum(60)
+        self.playback_fps_spin.setValue(DEFAULT_PLAYBACK_FPS)
+        self.playback_fps_spin.setSuffix(" FPS")
+        self.playback_fps_spin.setMinimumWidth(86)
+        self.playback_fps_spin.valueChanged.connect(self._update_playback_interval)
         self.frame_label = QLabel("Frame: -/-")
         self.frame_jump_spin = ArrowSpinBox()
         self.frame_jump_spin.setMinimum(1)
@@ -634,6 +647,8 @@ class AnnotatorMainWindow(QMainWindow):
         self.frame_jump_spin.valueChanged.connect(self._on_frame_jump_changed)
         nav_row.addWidget(self.fit_view_btn)
         nav_row.addWidget(self.frame_slider, 1)
+        nav_row.addWidget(self.playback_btn)
+        nav_row.addWidget(self.playback_fps_spin)
         nav_row.addWidget(self.frame_jump_spin)
         nav_row.addWidget(self.frame_label)
         center_layout.addLayout(nav_row)
@@ -1948,6 +1963,12 @@ class AnnotatorMainWindow(QMainWindow):
         self.fit_view_btn.setEnabled(enabled)
         self.frame_slider.setEnabled(enabled)
         self.frame_jump_spin.setEnabled(enabled)
+        self.playback_fps_spin.setEnabled(enabled)
+        if not enabled:
+            self._stop_playback()
+            self.playback_btn.setEnabled(False)
+        else:
+            self._sync_playback_controls()
         self.autosave_check.setEnabled(enabled)
         self.autosave_minutes_spin.setEnabled(enabled)
         self.propagation_mode_combo.setEnabled(enabled)
@@ -1985,6 +2006,7 @@ class AnnotatorMainWindow(QMainWindow):
         if not directory:
             return
 
+        self._stop_playback()
         self._set_status("Loading frames...", indeterminate=True)
         dir_path = Path(directory)
         frame_paths = sorted([p for p in dir_path.iterdir() if p.suffix.lower() in IMAGE_EXTS])
@@ -2293,22 +2315,73 @@ class AnnotatorMainWindow(QMainWindow):
                 self.target_frame_spin.setValue(current_value)
             self.target_frame_spin.blockSignals(False)
             self._update_target_chunk_label()
+        self._sync_playback_controls()
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """Navigate to the frame chosen in the slider widget."""
         if not self.frame_paths:
             return
+        self._stop_playback()
         self._set_current_frame_idx(value - 1)
 
     def _on_frame_jump_changed(self, value: int) -> None:
         """Navigate to the frame chosen in the numeric jump control."""
         if not self.frame_paths:
             return
+        self._stop_playback()
         target_idx = value - 1
         if self.auto_propagate_next and target_idx == self.current_frame_idx + 1:
             self.go_next_frame_shortcut()
             return
         self._set_current_frame_idx(target_idx)
+
+    def _playback_interval_ms(self) -> int:
+        """Return the timer interval for the selected playback frame rate."""
+        fps = max(1, int(self.playback_fps_spin.value()))
+        return max(1, int(round(1000 / fps)))
+
+    def _toggle_playback(self) -> None:
+        """Toggle preview playback from the navigation row."""
+        if self._playback_timer.isActive():
+            self._stop_playback()
+            return
+        self._start_playback()
+
+    def _start_playback(self) -> None:
+        """Start preview playback when there is a following frame to show."""
+        if not self.frame_paths or self.current_frame_idx >= len(self.frame_paths) - 1:
+            self._stop_playback()
+            return
+        self._playback_timer.start(self._playback_interval_ms())
+        self._sync_playback_controls()
+
+    def _stop_playback(self) -> None:
+        """Stop preview playback and reset the play button label."""
+        if self._playback_timer.isActive():
+            self._playback_timer.stop()
+        self._sync_playback_controls()
+
+    def _advance_playback_frame(self) -> None:
+        """Advance one frame for preview playback without triggering propagation."""
+        if not self.frame_paths or self.current_frame_idx >= len(self.frame_paths) - 1:
+            self._stop_playback()
+            return
+        self._set_current_frame_idx(self.current_frame_idx + 1)
+        if self.current_frame_idx >= len(self.frame_paths) - 1:
+            self._stop_playback()
+
+    def _update_playback_interval(self, _value: int) -> None:
+        """Apply FPS changes immediately while playback is active."""
+        if self._playback_timer.isActive():
+            self._playback_timer.start(self._playback_interval_ms())
+
+    def _sync_playback_controls(self) -> None:
+        """Keep playback controls consistent with frame availability and timer state."""
+        if not hasattr(self, "playback_btn"):
+            return
+        has_playable_frames = len(self.frame_paths) > 1 and self.frame_slider.isEnabled()
+        self.playback_btn.setEnabled(has_playable_frames)
+        self.playback_btn.setText("Pause" if self._playback_timer.isActive() else "Play")
 
     def fit_current_frame_to_view(self) -> None:
         """Reset zoom/pan so the current frame fits the canvas again."""
@@ -3650,6 +3723,7 @@ class AnnotatorMainWindow(QMainWindow):
 
     def _load_session(self, session_path: Path) -> None:
         """Restore a saved session, including objects, prompts, outputs, and research data."""
+        self._stop_playback()
         session_dir = session_path.parent
         progress_dialog = QProgressDialog("Loading session...", None, 0, 100, self)
         progress_dialog.setWindowTitle("Loading Session")
@@ -4576,6 +4650,7 @@ class AnnotatorMainWindow(QMainWindow):
     def closeEvent(self, event):
         """Stop timers and shut down the worker thread before the window closes."""
         try:
+            self._stop_playback()
             self._autosave_timer.stop()
             if self._sam_thread is not None:
                 self._sam_thread.quit()
