@@ -15,7 +15,6 @@ if str(SRC_ROOT) not in sys.path:
 
 from annotator.models import (
     BoxPrompt,
-    ExperimentalSettings,
     ObjectInfo,
     PointPrompt,
     PROPAGATION_MODE_COPY_BOXES,
@@ -81,15 +80,6 @@ class SessionPersistenceTests(unittest.TestCase):
                 use_point_prompts=False,
                 auto_propagate_next=True,
             ),
-            experimental_settings=ExperimentalSettings(
-                recondition_every_nth_frame=8,
-                recondition_high_conf_thresh=0.55,
-                recondition_high_iou_thresh=0.66,
-                use_one_session_chunked_propagation=True,
-                smart_propagation_enabled=False,
-                smart_propagation_rewind_frames=4,
-                smart_propagation_recovery_chunk_size=12,
-            ),
             prompt_mode_index=1,
         )
 
@@ -113,7 +103,6 @@ class SessionPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded.propagation_settings.mode, PROPAGATION_MODE_COPY_BOXES)
         self.assertTrue(loaded.propagation_settings.auto_propagate_next)
         self.assertEqual(loaded.view_settings.box_line_thickness, 4)
-        self.assertTrue(loaded.experimental_settings.use_one_session_chunked_propagation)
         self.assertEqual(loaded.outputs_by_frame[0].tracker_scores, [0.0])
         self.assertTrue(np.array_equal(loaded.outputs_by_frame[0].masks[0], mask))
 
@@ -122,6 +111,9 @@ class SessionPersistenceTests(unittest.TestCase):
             {
                 "frame_dir": "D:/frames",
                 "frame_files": ["0001.png"],
+                "experimental": {
+                    "legacy_setting": True,
+                },
                 "propagation": {"mode": "unexpected"},
                 "outputs": {
                     "0": {

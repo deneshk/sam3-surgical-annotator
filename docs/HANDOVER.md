@@ -5,9 +5,9 @@
 This workspace contains a desktop surgical video annotator built on top of a vendored SAM3 runtime.
 
 - `annotator_app/` is the app-owned codebase.
-- `sam3v2/` is the vendored SAM3 runtime tree plus upstream-style assets.
+- `sam3/` is the vendored SAM3 runtime tree plus upstream-style assets.
 
-This document is the current handover for the whole workspace. Treat `sam3v2/HANDOVER.md` as historical context from the pre-split layout, not as the primary source of truth.
+This document is the current handover for the whole workspace. Treat `sam3/HANDOVER.md` as historical context from the pre-split layout, not as the primary source of truth.
 
 ## Top-Level Layout
 
@@ -18,13 +18,12 @@ This document is the current handover for the whole workspace. Treat `sam3v2/HAN
 - `annotator_app/src/annotator/sam.py`: adapter and worker boundary to the vendored SAM3 predictor.
 - `annotator_app/src/annotator/models.py`: shared app dataclasses, defaults, and propagation constants.
 - `annotator_app/src/annotator/widgets.py`: canvas widget and frame jump control.
-- `annotator_app/src/annotator/propagation/`: pure helpers for prompt payloads, frame-output merges, smart propagation, and runtime state records.
+- `annotator_app/src/annotator/propagation/`: pure helpers for prompt payloads, frame-output merges, and runtime state records.
 - `annotator_app/src/annotator/persistence/`: session schema, JSON mapping, mask I/O, and repository boundary.
-- `annotator_app/src/annotator/prompts/text_prompt_grounding.py`: text-prompt proposal helpers.
 - `annotator_app/src/annotator/exporters/`: COCO and Perk export flows.
 - `annotator_app/src/annotator/research/`: optional research telemetry and experiment logging.
 - `annotator_app/tests/`: app-owned tests and the best quick behavioral reference after the code itself.
-- `sam3v2/sam3/model/sam3_video_predictor.py`: main vendor predictor used by the app.
+- `sam3/sam3/model/sam3_video_predictor.py`: main vendor predictor used by the app.
 
 ## What The Project Does
 
@@ -39,7 +38,6 @@ Core user-facing workflows:
 - Run current-frame segmentation with SAM3.
 - Run forward propagation in either tracker mode or copy-boxes mode.
 - Optionally auto-propagate one frame ahead and prefetch next-frame outputs.
-- Generate temporary current-frame proposals from a text prompt, then accept selected proposals into real tracked objects.
 - Flag review frames.
 - Save and load sessions, including masks and research telemetry.
 - Export annotations as COCO-style JSON plus mask PNGs, or as Perk-format CSV.
@@ -56,12 +54,12 @@ Important boundaries:
 - Persistence boundary: `annotator_app/src/annotator/persistence/session_repository.py`
 - Pure propagation logic: `annotator_app/src/annotator/propagation/*`
 - Research telemetry: `annotator_app/src/annotator/research/*`
-- Vendor runtime: `sam3v2/`
+- Vendor runtime: `sam3/`
 
 Rule of thumb for future work:
 
 - If the task is app behavior, start in `annotator_app/`.
-- Only edit `sam3v2/` when the app/runtime integration truly requires it.
+- Only edit `sam3/` when the app/runtime integration truly requires it.
 
 ## Core State Model
 
@@ -91,7 +89,7 @@ Box behavior matters:
 
 The app imports the vendored runtime through `annotator.vendor.sam3_runtime.ensure_vendor_sam3_on_path()`.
 
-- Default vendor root: `D:\SAM3Annotator\sam3v2`
+- Default vendor root: `D:\SAM3Annotator\sam3`
 - Override path: `SAM3_VENDOR_ROOT`
 
 `Sam3Adapter` wraps `Sam3VideoPredictor`, and `SamWorker` serializes all SAM work through one Qt worker thread.
@@ -101,10 +99,7 @@ Current behavior:
 - SAM is initialized lazily, usually on first frame-directory load or first task that needs it.
 - The app uses one worker and one adapter, not multiple concurrent SAM model instances.
 - Current-frame segmentation uses a fresh 1-frame session.
-- Text-prompt proposal generation uses a fresh 1-frame session.
 - Tracker propagation uses chunk-local sessions by default.
-- Experimental one-session propagation reuses one full-video session across chunks in a single run.
-- Experimental reconditioning settings are hot-applied to the live SAM model.
 - Auto-propagate/prefetch also uses the same worker queue and can be canceled and restarted.
 
 ## Propagation Model
@@ -121,13 +116,6 @@ Tracker seeding rules are important:
 - If an enabled object has no usable seed data, propagation aborts with a warning.
 - Point prompts can be excluded from tracker seeding via `Use Point Prompts for Propagation`.
 - Propagation enablement is frame-local: objects without seed data are disabled on that frame.
-
-Experimental smart propagation:
-
-- Only applies in tracker mode.
-- Requires `Use Target Frame`.
-- Is disabled while one-session chunked propagation is enabled.
-- When a previously seen object disappears, the app can rewind a few frames and launch a larger recovery chunk.
 
 ## Persistence And Export
 
@@ -157,7 +145,6 @@ Coverage is focused on:
 - propagation helpers
 - session persistence
 - runtime state records
-- smart propagation decision logic
 - research telemetry helpers
 
 Some research/controller tests skip automatically when `PySide6` is unavailable.
@@ -170,11 +157,11 @@ Use this priority order when facts disagree:
 2. App tests in `annotator_app/tests/*`
 3. This handover
 4. `annotator_app/README.md`
-5. Historical documents such as `sam3v2/HANDOVER.md`, `sam3v2/REFACTOR_REVIEW.md`, or older annotator docs
+5. Historical documents such as `sam3/HANDOVER.md`, `sam3/REFACTOR_REVIEW.md`, or older annotator docs
 
 Known stale or partially stale references:
 
-- `sam3v2/HANDOVER.md`: pre-split handover, useful historically but not layout-accurate
+- `sam3/HANDOVER.md`: pre-split handover, useful historically but not layout-accurate
 - `annotator_app/docs/README_surgical_annotator.md`: useful overview, but some feature notes lag current code
 
 ## Suggested Reading Order For A New Coding Agent
@@ -188,7 +175,7 @@ Known stale or partially stale references:
 7. Read `annotator_app/src/annotator/persistence/session_models.py`, `session_mapper.py`, and `session_repository.py`.
 8. Read `annotator_app/src/annotator/research/controller.py` and `experiment.py` if the task touches research mode.
 9. Read `annotator_app/tests/*` for behavioral expectations.
-10. Only then descend into `sam3v2/` if the task truly touches model internals or vendor integration.
+10. Only then descend into `sam3/` if the task truly touches model internals or vendor integration.
 
 ## Recommended Agent Initialization Prompt
 
@@ -199,12 +186,12 @@ Start with docs/HANDOVER.md and treat it as the current repo-level handover.
 
 Repository ownership:
 - annotator_app/ = app-owned code
-- sam3v2/ = vendored SAM3 runtime
+- sam3/ = vendored SAM3 runtime
 
 Default approach:
 - Inspect and edit annotator_app first.
-- Only touch sam3v2 if the task clearly requires vendor/runtime changes.
-- Do not rely on sam3v2/HANDOVER.md as the primary source of truth; it is historical.
+- Only touch sam3 if the task clearly requires vendor/runtime changes.
+- Do not rely on sam3/HANDOVER.md as the primary source of truth; it is historical.
 
 Read in this order:
 1. docs/HANDOVER.md

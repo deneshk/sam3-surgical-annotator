@@ -7,15 +7,13 @@ through the main window.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 
 TASK_KIND_PREFETCH = "prefetch"
 TASK_KIND_PREFETCH_WAIT = "prefetch_wait"
 TASK_KIND_MANUAL_PROPAGATION = "manual"
 TASK_KIND_AUTO_PROPAGATION = "auto"
-TASK_KIND_TEXT_PROMPT = "text_prompt"
-TASK_KIND_UPDATE_EXPERIMENTAL_SETTINGS = "update_experimental_settings"
 
 
 @dataclass
@@ -27,7 +25,6 @@ class SamTaskContext:
     target_frame_idx: Optional[int] = None
     cache_generation: Optional[int] = None
     last_emitted_frame_idx: Optional[int] = None
-    use_one_session: bool = False
     n_frames: Optional[int] = None
 
     def get(self, key: str, default=None):
@@ -157,24 +154,12 @@ class PropagationRuntimeState:
     active_seed_frame_idx: Optional[int] = None
     task_id: Optional[str] = None
     stop_requested: bool = False
-    seen_obj_ids: Set[int] = field(default_factory=set)
-    lost_obj_ids: Set[int] = field(default_factory=set)
-    waiting_for_recovery_obj_ids: Set[int] = field(default_factory=set)
-    loss_notified: bool = False
-    smart_restart_requested: bool = False
-    triggered_loss_keys: Set[Tuple[int, int]] = field(default_factory=set)
 
     def begin_run(self, *, enabled_obj_ids: Set[int], view_frame_idx: int) -> None:
-        """Initialize per-run loss tracking and active object scope."""
+        """Initialize active object scope for a propagation run."""
         self.enabled_obj_ids = set(enabled_obj_ids)
         self.view_frame_idx = int(view_frame_idx)
         self.stop_requested = False
-        self.smart_restart_requested = False
-        self.seen_obj_ids.clear()
-        self.lost_obj_ids.clear()
-        self.waiting_for_recovery_obj_ids.clear()
-        self.loss_notified = False
-        self.triggered_loss_keys.clear()
 
     def begin_chunk(self, *, chunk_idx: int, seed_frame_idx: int, task_id: str) -> None:
         """Mark one propagation chunk as in flight."""
@@ -197,9 +182,3 @@ class PropagationRuntimeState:
         self.view_frame_idx = None
         self.continue_after_chunk = False
         self.stop_requested = False
-        self.seen_obj_ids.clear()
-        self.lost_obj_ids.clear()
-        self.waiting_for_recovery_obj_ids.clear()
-        self.loss_notified = False
-        self.smart_restart_requested = False
-        self.triggered_loss_keys.clear()

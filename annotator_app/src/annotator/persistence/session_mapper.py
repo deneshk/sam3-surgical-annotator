@@ -11,7 +11,6 @@ import numpy as np
 
 from annotator.models import (
     BoxPrompt,
-    ExperimentalSettings,
     ObjectInfo,
     PointPrompt,
     PropagationSettings,
@@ -77,19 +76,6 @@ def payload_to_data(payload: SessionPayload) -> tuple[dict[str, object], list[Se
             "translate_prompts": bool(payload.propagation_settings.translate_prompts),
             "use_point_prompts": bool(payload.propagation_settings.use_point_prompts),
             "auto_propagate_next": bool(payload.propagation_settings.auto_propagate_next),
-        },
-        "experimental": {
-            "recondition_every_nth_frame": int(payload.experimental_settings.recondition_every_nth_frame),
-            "recondition_high_conf_thresh": float(payload.experimental_settings.recondition_high_conf_thresh),
-            "recondition_high_iou_thresh": float(payload.experimental_settings.recondition_high_iou_thresh),
-            "use_one_session_chunked_propagation": bool(
-                payload.experimental_settings.use_one_session_chunked_propagation
-            ),
-            "smart_propagation_enabled": bool(payload.experimental_settings.smart_propagation_enabled),
-            "smart_propagation_rewind_frames": int(payload.experimental_settings.smart_propagation_rewind_frames),
-            "smart_propagation_recovery_chunk_size": int(
-                payload.experimental_settings.smart_propagation_recovery_chunk_size
-            ),
         },
         "prompt_mode_index": int(payload.prompt_mode_index),
     }
@@ -256,7 +242,6 @@ def data_to_payload(
 
     view = dict(data.get("view", {}))
     propagation = dict(data.get("propagation", {}))
-    experimental = dict(data.get("experimental", {}))
     object_view = dict(data.get("object_view", {}))
 
     return SessionPayload(
@@ -311,44 +296,6 @@ def data_to_payload(
             translate_prompts=bool(propagation.get("translate_prompts", True)),
             use_point_prompts=bool(propagation.get("use_point_prompts", True)),
             auto_propagate_next=bool(propagation.get("auto_propagate_next", False)),
-        ),
-        experimental_settings=ExperimentalSettings(
-            recondition_every_nth_frame=int(
-                experimental.get(
-                    "recondition_every_nth_frame",
-                    ExperimentalSettings().recondition_every_nth_frame,
-                )
-            ),
-            recondition_high_conf_thresh=float(
-                experimental.get(
-                    "recondition_high_conf_thresh",
-                    ExperimentalSettings().recondition_high_conf_thresh,
-                )
-            ),
-            recondition_high_iou_thresh=float(
-                experimental.get(
-                    "recondition_high_iou_thresh",
-                    ExperimentalSettings().recondition_high_iou_thresh,
-                )
-            ),
-            use_one_session_chunked_propagation=bool(
-                experimental.get("use_one_session_chunked_propagation", False)
-            ),
-            smart_propagation_enabled=bool(
-                experimental.get("smart_propagation_enabled", False)
-            ),
-            smart_propagation_rewind_frames=int(
-                experimental.get(
-                    "smart_propagation_rewind_frames",
-                    ExperimentalSettings().smart_propagation_rewind_frames,
-                )
-            ),
-            smart_propagation_recovery_chunk_size=int(
-                experimental.get(
-                    "smart_propagation_recovery_chunk_size",
-                    ExperimentalSettings().smart_propagation_recovery_chunk_size,
-                )
-            ),
         ),
         prompt_mode_index=int(data.get("prompt_mode_index", 2)),
     )

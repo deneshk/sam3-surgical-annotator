@@ -13,7 +13,6 @@ import numpy as np
 
 from annotator.models import (
     BoxPrompt,
-    ExperimentalSettings,
     ObjectInfo,
     PointPrompt,
     PropagationSettings,
@@ -52,6 +51,5 @@ class SessionPayload:
     outputs_by_frame: Dict[int, SamFrameOutput] = field(default_factory=dict)
     view_settings: ViewSettings = field(default_factory=ViewSettings)
     propagation_settings: PropagationSettings = field(default_factory=PropagationSettings)
-    experimental_settings: ExperimentalSettings = field(default_factory=ExperimentalSettings)
     prompt_mode_index: int = 2
     version: int = SESSION_SCHEMA_VERSION

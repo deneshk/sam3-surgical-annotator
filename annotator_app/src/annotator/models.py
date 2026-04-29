@@ -17,11 +17,6 @@ DEFAULT_PROPAGATION_CHUNK_SIZE = 2
 DEFAULT_PROPAGATION_CHUNKS = 1
 DEFAULT_SEGMENTATION_OPACITY = 0.6
 DEFAULT_BOX_LINE_THICKNESS = 2
-DEFAULT_RECONDITION_EVERY_NTH_FRAME = 16
-DEFAULT_RECONDITION_HIGH_CONF_THRESH = 0.8
-DEFAULT_RECONDITION_HIGH_IOU_THRESH = 0.8
-DEFAULT_SMART_PROPAGATION_REWIND_FRAMES = 3
-DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE = 50
 
 
 def normalize_propagation_mode(value: object) -> str:
@@ -102,19 +97,6 @@ class PropagationSettings:
 
 
 @dataclass
-class ExperimentalSettings:
-    """Tracker tuning and recovery options that are surfaced as advanced controls."""
-
-    recondition_every_nth_frame: int = DEFAULT_RECONDITION_EVERY_NTH_FRAME
-    recondition_high_conf_thresh: float = DEFAULT_RECONDITION_HIGH_CONF_THRESH
-    recondition_high_iou_thresh: float = DEFAULT_RECONDITION_HIGH_IOU_THRESH
-    use_one_session_chunked_propagation: bool = False
-    smart_propagation_enabled: bool = False
-    smart_propagation_rewind_frames: int = DEFAULT_SMART_PROPAGATION_REWIND_FRAMES
-    smart_propagation_recovery_chunk_size: int = DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE
-
-
-@dataclass
 class PendingPropagationState:
     """Mutable state for a multi-chunk propagation run that is currently in progress."""
 
@@ -126,6 +108,3 @@ class PendingPropagationState:
     completed_chunks: int = 0
     run_start_frame_idx: int = 0
     active_chunk_n_frames: Optional[int] = None
-    pending_smart_restart_seed_frame_idx: Optional[int] = None
-    pending_smart_restart_loss_frame_idx: Optional[int] = None
-    smart_restart_cooldown_until_frame_idx: Optional[int] = None

@@ -56,13 +56,7 @@ from annotator.models import (
     DEFAULT_BOX_LINE_THICKNESS,
     DEFAULT_PROPAGATION_CHUNK_SIZE,
     DEFAULT_PROPAGATION_CHUNKS,
-    DEFAULT_RECONDITION_EVERY_NTH_FRAME,
-    DEFAULT_RECONDITION_HIGH_CONF_THRESH,
-    DEFAULT_RECONDITION_HIGH_IOU_THRESH,
     DEFAULT_SEGMENTATION_OPACITY,
-    DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE,
-    DEFAULT_SMART_PROPAGATION_REWIND_FRAMES,
-    ExperimentalSettings,
     ObjectInfo,
     PendingPropagationState,
     PointPrompt,
@@ -75,15 +69,6 @@ from annotator.models import (
 )
 from annotator.persistence.session_models import SessionPayload
 from annotator.persistence.session_repository import SessionRepository
-from annotator.prompts.text_prompt_grounding import (
-    TextPromptProposal,
-    build_text_prompt_proposals,
-    next_prompt_object_name,
-)
-from annotator.propagation.smart_propagation import (
-    SmartPropagationSettings,
-    detect_smart_propagation_restart,
-)
 from annotator.propagation.runtime import (
     PrefetchState,
     PropagationRuntimeState,
@@ -91,8 +76,6 @@ from annotator.propagation.runtime import (
     TASK_KIND_MANUAL_PROPAGATION,
     TASK_KIND_PREFETCH,
     TASK_KIND_PREFETCH_WAIT,
-    TASK_KIND_TEXT_PROMPT,
-    TASK_KIND_UPDATE_EXPERIMENTAL_SETTINGS,
 )
 from annotator.propagation.frame_outputs import (
     merge_frame_outputs,
@@ -151,9 +134,6 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_locked_by_frame_obj: Dict[int, Dict[int, bool]] = {}
         self.outputs_by_frame: Dict[int, SamFrameOutput] = {}
         self.manual_propagation_overrides_by_frame_obj: Dict[int, Dict[int, bool]] = {}
-        self._text_prompt_proposals_frame_idx: Optional[int] = None
-        self._text_prompt_last_prompt: str = ""
-        self._text_prompt_proposals: List[TextPromptProposal] = []
         self._active_prompt_rows: List[Tuple[str, int]] = []
 
         self.segment_mode: bool = False
@@ -178,7 +158,6 @@ class AnnotatorMainWindow(QMainWindow):
         self._output_version_by_frame: Dict[int, int] = {}
         self._undo_state: Optional[dict] = None
         self._last_prompt_edit_frame: Optional[int] = None
-        self._one_session_chunk_cache_generation: Optional[int] = None
         self._session_dir: Optional[Path] = None
         self._autosave_timer = QTimer(self)
         self._autosave_timer.timeout.connect(self._handle_autosave)
@@ -198,15 +177,8 @@ class AnnotatorMainWindow(QMainWindow):
         self.translate_prompts_on_propagation: bool = True
         self.use_point_prompts_for_propagation: bool = True
         self.use_target_frame: bool = False
-        self.use_one_session_chunked_propagation: bool = False
-        self.smart_propagation_enabled: bool = False
-        self.smart_propagation_rewind_frames: int = DEFAULT_SMART_PROPAGATION_REWIND_FRAMES
-        self.smart_propagation_recovery_chunk_size: int = DEFAULT_SMART_PROPAGATION_RECOVERY_CHUNK_SIZE
         self.segmentation_opacity: float = DEFAULT_SEGMENTATION_OPACITY
         self.box_line_thickness: int = DEFAULT_BOX_LINE_THICKNESS
-        self.recondition_every_nth_frame: int = DEFAULT_RECONDITION_EVERY_NTH_FRAME
-        self.recondition_high_conf_thresh: float = DEFAULT_RECONDITION_HIGH_CONF_THRESH
-        self.recondition_high_iou_thresh: float = DEFAULT_RECONDITION_HIGH_IOU_THRESH
         self._research_mode_enabled: bool = bool(research_mode_enabled)
         self._research_controller = ResearchController(self, enabled=self._research_mode_enabled)
 
@@ -427,56 +399,6 @@ class AnnotatorMainWindow(QMainWindow):
     def _propagation_stop_requested(self, value: bool) -> None:
         """Compatibility shim updating ``PropagationRuntimeState.stop_requested``."""
         self._propagation_runtime.stop_requested = bool(value)
-
-    @property
-    def _propagation_seen_obj_ids(self) -> set[int]:
-        """Compatibility shim exposing the set of objects seen during the current run."""
-        return self._propagation_runtime.seen_obj_ids
-
-    @property
-    def _propagation_lost_obj_ids(self) -> set[int]:
-        """Compatibility shim exposing objects marked lost during smart propagation."""
-        return self._propagation_runtime.lost_obj_ids
-
-    @property
-    def _smart_propagation_waiting_for_recovery_obj_ids(self) -> set[int]:
-        """Compatibility shim exposing objects waiting for recovery after a rewind."""
-        return self._propagation_runtime.waiting_for_recovery_obj_ids
-
-    @property
-    def _propagation_loss_notified(self) -> bool:
-        """Compatibility shim exposing ``PropagationRuntimeState.loss_notified``."""
-        return self._propagation_runtime.loss_notified
-
-    @_propagation_loss_notified.setter
-    def _propagation_loss_notified(self, value: bool) -> None:
-        """Compatibility shim updating ``PropagationRuntimeState.loss_notified``."""
-        self._propagation_runtime.loss_notified = bool(value)
-
-    @property
-    def _propagation_smart_restart_requested(self) -> bool:
-        """Compatibility shim exposing ``PropagationRuntimeState.smart_restart_requested``."""
-        return self._propagation_runtime.smart_restart_requested
-
-    @_propagation_smart_restart_requested.setter
-    def _propagation_smart_restart_requested(self, value: bool) -> None:
-        """Compatibility shim updating ``PropagationRuntimeState.smart_restart_requested``."""
-        self._propagation_runtime.smart_restart_requested = bool(value)
-
-    @property
-    def _smart_propagation_triggered_loss_keys(self) -> set[tuple[int, int]]:
-        """Compatibility shim exposing the set of loss events that already triggered rewinds."""
-        return self._propagation_runtime.triggered_loss_keys
-
-    @property
-    def _one_session_chunk_prompt_version(self) -> Optional[int]:
-        """Compatibility shim exposing the prompt generation for one-session chunk reuse."""
-        return self._one_session_chunk_cache_generation
-
-    @_one_session_chunk_prompt_version.setter
-    def _one_session_chunk_prompt_version(self, value: Optional[int]) -> None:
-        """Compatibility shim updating the prompt generation for one-session chunk reuse."""
-        self._one_session_chunk_cache_generation = value
 
     def _focus_canvas(self) -> None:
         """Return keyboard focus to the canvas so navigation shortcuts stay active."""
@@ -731,7 +653,6 @@ class AnnotatorMainWindow(QMainWindow):
         right_layout.addWidget(control_tabs)
         control_tabs.addTab(self._build_prompt_tab(), "Prompting")
         control_tabs.addTab(self._build_processing_tab(), "Segment / Propagate")
-        control_tabs.addTab(self._build_experimental_tab(), "Experimental Features")
         return right_panel
 
     def _build_prompt_tab(self) -> QWidget:
@@ -753,26 +674,6 @@ class AnnotatorMainWindow(QMainWindow):
         obj_row.addWidget(self.add_obj_btn)
         obj_row.addWidget(self.remove_obj_btn)
         prompt_layout.addLayout(obj_row)
-
-        self.text_prompt_input = QLineEdit()
-        self.text_prompt_input.setPlaceholderText("Frame text prompt, e.g. dog")
-        prompt_layout.addWidget(QLabel("Text Prompt Objects"))
-        prompt_layout.addWidget(self.text_prompt_input)
-
-        text_prompt_row = QHBoxLayout()
-        self.generate_text_prompt_btn = QPushButton("Generate Objects")
-        self.generate_text_prompt_btn.clicked.connect(self.generate_objects_from_text_prompt)
-        self.accept_text_prompt_btn = QPushButton("Accept Selected")
-        self.accept_text_prompt_btn.clicked.connect(self.accept_selected_text_prompt_proposals)
-        self.clear_text_prompt_btn = QPushButton("Clear Proposals")
-        self.clear_text_prompt_btn.clicked.connect(self.clear_text_prompt_proposals)
-        text_prompt_row.addWidget(self.generate_text_prompt_btn)
-        text_prompt_row.addWidget(self.accept_text_prompt_btn)
-        text_prompt_row.addWidget(self.clear_text_prompt_btn)
-        prompt_layout.addLayout(text_prompt_row)
-
-        self.text_prompt_list = QListWidget()
-        prompt_layout.addWidget(self.text_prompt_list)
 
         self.lock_all_boxes_check = QCheckBox("Lock All Boxes")
         self.lock_all_boxes_check.toggled.connect(self._on_lock_all_boxes_toggled)
@@ -951,78 +852,6 @@ class AnnotatorMainWindow(QMainWindow):
         processing_layout.addStretch(1)
         return processing_tab
 
-    def _build_experimental_tab(self) -> QWidget:
-        """Build the tracker heuristic controls that are intentionally optional."""
-        experimental_tab = QWidget()
-        experimental_layout = QVBoxLayout(experimental_tab)
-        experimental_layout.addWidget(QLabel("Experimental tracker heuristics"))
-        experimental_layout.addWidget(
-            QLabel("These settings map to SAM3 periodic re-prompting and apply to future tracker operations.")
-        )
-
-        experimental_form = QFormLayout()
-        self.recondition_every_nth_frame_spin = QSpinBox()
-        self.recondition_every_nth_frame_spin.setMinimum(0)
-        self.recondition_every_nth_frame_spin.setMaximum(9999)
-        self.recondition_every_nth_frame_spin.setValue(self.recondition_every_nth_frame)
-        self.recondition_every_nth_frame_spin.setToolTip("0 disables periodic re-prompting.")
-        self.recondition_every_nth_frame_spin.valueChanged.connect(self._on_experimental_settings_changed)
-        experimental_form.addRow("Re-prompt Every N Frames", self.recondition_every_nth_frame_spin)
-
-        self.recondition_high_conf_thresh_spin = QDoubleSpinBox()
-        self.recondition_high_conf_thresh_spin.setMinimum(0.0)
-        self.recondition_high_conf_thresh_spin.setMaximum(1.0)
-        self.recondition_high_conf_thresh_spin.setSingleStep(0.05)
-        self.recondition_high_conf_thresh_spin.setDecimals(2)
-        self.recondition_high_conf_thresh_spin.setValue(self.recondition_high_conf_thresh)
-        self.recondition_high_conf_thresh_spin.valueChanged.connect(self._on_experimental_settings_changed)
-        experimental_form.addRow("High Confidence Threshold", self.recondition_high_conf_thresh_spin)
-
-        self.recondition_high_iou_thresh_spin = QDoubleSpinBox()
-        self.recondition_high_iou_thresh_spin.setMinimum(0.0)
-        self.recondition_high_iou_thresh_spin.setMaximum(1.0)
-        self.recondition_high_iou_thresh_spin.setSingleStep(0.05)
-        self.recondition_high_iou_thresh_spin.setDecimals(2)
-        self.recondition_high_iou_thresh_spin.setValue(self.recondition_high_iou_thresh)
-        self.recondition_high_iou_thresh_spin.valueChanged.connect(self._on_experimental_settings_changed)
-        experimental_form.addRow("High IoU Threshold", self.recondition_high_iou_thresh_spin)
-
-        self.use_one_session_chunked_propagation_check = QCheckBox("Use One Session for Chunked Propagation")
-        self.use_one_session_chunked_propagation_check.setChecked(self.use_one_session_chunked_propagation)
-        self.use_one_session_chunked_propagation_check.setToolTip(
-            "Keep tracker propagation chunked in the UI, but reuse one full-video SAM3 session across chunks."
-        )
-        self.use_one_session_chunked_propagation_check.toggled.connect(
-            self._on_use_one_session_chunked_propagation_toggled
-        )
-        experimental_layout.addWidget(self.use_one_session_chunked_propagation_check)
-
-        self.smart_propagation_check = QCheckBox("Enable Smart Propagation")
-        self.smart_propagation_check.setChecked(self.smart_propagation_enabled)
-        self.smart_propagation_check.setToolTip(
-            "On target-frame tracker runs, rewind a few frames and run a larger recovery chunk after an object disappears."
-        )
-        self.smart_propagation_check.toggled.connect(self._on_experimental_settings_changed)
-        experimental_layout.addWidget(self.smart_propagation_check)
-
-        self.smart_propagation_rewind_spin = QSpinBox()
-        self.smart_propagation_rewind_spin.setMinimum(0)
-        self.smart_propagation_rewind_spin.setMaximum(9999)
-        self.smart_propagation_rewind_spin.setValue(self.smart_propagation_rewind_frames)
-        self.smart_propagation_rewind_spin.valueChanged.connect(self._on_experimental_settings_changed)
-        experimental_form.addRow("Smart Rewind Frames", self.smart_propagation_rewind_spin)
-
-        self.smart_propagation_chunk_size_spin = QSpinBox()
-        self.smart_propagation_chunk_size_spin.setMinimum(2)
-        self.smart_propagation_chunk_size_spin.setMaximum(9999)
-        self.smart_propagation_chunk_size_spin.setValue(self.smart_propagation_recovery_chunk_size)
-        self.smart_propagation_chunk_size_spin.valueChanged.connect(self._on_experimental_settings_changed)
-        experimental_form.addRow("Recovery Chunk Size", self.smart_propagation_chunk_size_spin)
-
-        experimental_layout.addLayout(experimental_form)
-        experimental_layout.addStretch(1)
-        return experimental_tab
-
     def _register_advanced_widgets(self) -> None:
         """Track widgets that can be globally shown or hidden as advanced controls."""
         self._advanced_widgets = [
@@ -1060,7 +889,6 @@ class AnnotatorMainWindow(QMainWindow):
         for widget in (
             self.checkpoint_combo,
             self.frame_jump_spin,
-            self.text_prompt_input,
             self.autosave_minutes_spin,
             self.segmentation_opacity_spin,
             self.box_line_thickness_spin,
@@ -1068,13 +896,6 @@ class AnnotatorMainWindow(QMainWindow):
             self.chunks_spin,
             self.target_frame_spin,
             self.propagation_mode_combo,
-            self.recondition_every_nth_frame_spin,
-            self.recondition_high_conf_thresh_spin,
-            self.recondition_high_iou_thresh_spin,
-            self.use_one_session_chunked_propagation_check,
-            self.smart_propagation_check,
-            self.smart_propagation_rewind_spin,
-            self.smart_propagation_chunk_size_spin,
         ):
             self._install_focus_return_on_widget(widget)
 
@@ -1135,91 +956,6 @@ class AnnotatorMainWindow(QMainWindow):
         """Store whether tracker propagation seeds should include point prompts."""
         self.use_point_prompts_for_propagation = checked
 
-    def _on_use_one_session_chunked_propagation_toggled(self, checked: bool) -> None:
-        """Toggle one-session chunk reuse and refresh dependent experimental controls."""
-        self.use_one_session_chunked_propagation = checked
-        if not checked:
-            self._one_session_chunk_cache_generation = None
-        self._sync_experimental_controls()
-
-    def _on_experimental_settings_changed(self, _value) -> None:
-        """Pull advanced tracker settings from widgets and push them to live state."""
-        if hasattr(self, "recondition_every_nth_frame_spin"):
-            self.recondition_every_nth_frame = int(self.recondition_every_nth_frame_spin.value())
-        if hasattr(self, "recondition_high_conf_thresh_spin"):
-            self.recondition_high_conf_thresh = float(self.recondition_high_conf_thresh_spin.value())
-        if hasattr(self, "recondition_high_iou_thresh_spin"):
-            self.recondition_high_iou_thresh = float(self.recondition_high_iou_thresh_spin.value())
-        if hasattr(self, "smart_propagation_check"):
-            self.smart_propagation_enabled = bool(self.smart_propagation_check.isChecked())
-        if hasattr(self, "smart_propagation_rewind_spin"):
-            self.smart_propagation_rewind_frames = int(self.smart_propagation_rewind_spin.value())
-        if hasattr(self, "smart_propagation_chunk_size_spin"):
-            self.smart_propagation_recovery_chunk_size = int(self.smart_propagation_chunk_size_spin.value())
-        self._sync_experimental_controls()
-        self._apply_experimental_settings_live()
-
-    def _apply_experimental_settings_live(self) -> None:
-        """Push tracker tuning changes to the live SAM worker without rebuilding the session."""
-        if self._sam_worker is None or not self._sam_ready:
-            return
-        task_id = self._enqueue_sam_task(
-            "update_experimental_settings",
-            {
-                "recondition_every_nth_frame": self.recondition_every_nth_frame,
-                "recondition_high_conf_thresh": self.recondition_high_conf_thresh,
-                "recondition_high_iou_thresh": self.recondition_high_iou_thresh,
-            },
-            priority=True,
-        )
-        self._sam_task_contexts[task_id] = SamTaskContext(
-            kind=TASK_KIND_UPDATE_EXPERIMENTAL_SETTINGS
-        )
-        self._wait_for_sam_task(task_id)
-
-    def _sync_experimental_controls(self) -> None:
-        """Keep advanced widgets aligned with the current experimental feature state."""
-        if hasattr(self, "recondition_every_nth_frame_spin"):
-            self.recondition_every_nth_frame_spin.blockSignals(True)
-            self.recondition_every_nth_frame_spin.setValue(int(self.recondition_every_nth_frame))
-            self.recondition_every_nth_frame_spin.blockSignals(False)
-        if hasattr(self, "recondition_high_conf_thresh_spin"):
-            self.recondition_high_conf_thresh_spin.blockSignals(True)
-            self.recondition_high_conf_thresh_spin.setValue(float(self.recondition_high_conf_thresh))
-            self.recondition_high_conf_thresh_spin.blockSignals(False)
-        if hasattr(self, "recondition_high_iou_thresh_spin"):
-            self.recondition_high_iou_thresh_spin.blockSignals(True)
-            self.recondition_high_iou_thresh_spin.setValue(float(self.recondition_high_iou_thresh))
-            self.recondition_high_iou_thresh_spin.blockSignals(False)
-        if hasattr(self, "use_one_session_chunked_propagation_check"):
-            self.use_one_session_chunked_propagation_check.blockSignals(True)
-            self.use_one_session_chunked_propagation_check.setChecked(
-                bool(self.use_one_session_chunked_propagation)
-            )
-            self.use_one_session_chunked_propagation_check.blockSignals(False)
-        smart_controls_enabled = not bool(self.use_one_session_chunked_propagation)
-        if hasattr(self, "smart_propagation_check"):
-            self.smart_propagation_check.blockSignals(True)
-            self.smart_propagation_check.setChecked(bool(self.smart_propagation_enabled))
-            self.smart_propagation_check.setEnabled(smart_controls_enabled)
-            tooltip = (
-                "On target-frame tracker runs, rewind a few frames and run a larger recovery chunk after an object disappears."
-            )
-            if not smart_controls_enabled:
-                tooltip += " Disabled while one-session chunked propagation is enabled."
-            self.smart_propagation_check.setToolTip(tooltip)
-            self.smart_propagation_check.blockSignals(False)
-        if hasattr(self, "smart_propagation_rewind_spin"):
-            self.smart_propagation_rewind_spin.blockSignals(True)
-            self.smart_propagation_rewind_spin.setValue(int(self.smart_propagation_rewind_frames))
-            self.smart_propagation_rewind_spin.setEnabled(smart_controls_enabled)
-            self.smart_propagation_rewind_spin.blockSignals(False)
-        if hasattr(self, "smart_propagation_chunk_size_spin"):
-            self.smart_propagation_chunk_size_spin.blockSignals(True)
-            self.smart_propagation_chunk_size_spin.setValue(int(self.smart_propagation_recovery_chunk_size))
-            self.smart_propagation_chunk_size_spin.setEnabled(smart_controls_enabled)
-            self.smart_propagation_chunk_size_spin.blockSignals(False)
-
     def _on_propagation_target_toggled(self, checked: bool) -> None:
         """Switch between explicit chunk-count mode and target-frame planning mode."""
         self.use_target_frame = checked
@@ -1265,24 +1001,6 @@ class AnnotatorMainWindow(QMainWindow):
             self.computed_chunks_label.setText("Chunks: -")
         else:
             self.computed_chunks_label.setText(f"Chunks: {chunks}")
-
-    def _smart_propagation_settings(self) -> SmartPropagationSettings:
-        """Package the current smart-restart controls for the pure decision helper."""
-        return SmartPropagationSettings(
-            enabled=bool(self.smart_propagation_enabled),
-            rewind_frames=int(self.smart_propagation_rewind_frames),
-            recovery_chunk_size=int(self.smart_propagation_recovery_chunk_size),
-        )
-
-    def _is_smart_propagation_available_for_run(self) -> bool:
-        """Return whether the current propagation configuration can use recovery rewinds."""
-        settings = self._smart_propagation_settings()
-        return (
-            settings.enabled
-            and self.use_target_frame_check.isChecked()
-            and self._is_tracker_propagation_mode()
-            and not self.use_one_session_chunked_propagation
-        )
 
     def request_stop_propagation(self) -> None:
         """Stop the active propagation run or clear a queued run before it starts."""
@@ -1753,29 +1471,6 @@ class AnnotatorMainWindow(QMainWindow):
             target_idx = max(0, min(len(self.frame_paths) - 1, target_idx))
         self.target_frame_spin.setValue(target_idx + 1)
 
-    def _current_experimental_settings(self) -> ExperimentalSettings:
-        """Capture current advanced tracker settings for session persistence."""
-        return ExperimentalSettings(
-            recondition_every_nth_frame=int(self.recondition_every_nth_frame),
-            recondition_high_conf_thresh=float(self.recondition_high_conf_thresh),
-            recondition_high_iou_thresh=float(self.recondition_high_iou_thresh),
-            use_one_session_chunked_propagation=bool(self.use_one_session_chunked_propagation),
-            smart_propagation_enabled=bool(self.smart_propagation_enabled),
-            smart_propagation_rewind_frames=int(self.smart_propagation_rewind_frames),
-            smart_propagation_recovery_chunk_size=int(self.smart_propagation_recovery_chunk_size),
-        )
-
-    def _apply_experimental_settings(self, settings: ExperimentalSettings) -> None:
-        """Restore persisted advanced tracker settings and refresh the controls."""
-        self.recondition_every_nth_frame = int(settings.recondition_every_nth_frame)
-        self.recondition_high_conf_thresh = float(settings.recondition_high_conf_thresh)
-        self.recondition_high_iou_thresh = float(settings.recondition_high_iou_thresh)
-        self.use_one_session_chunked_propagation = bool(settings.use_one_session_chunked_propagation)
-        self.smart_propagation_enabled = bool(settings.smart_propagation_enabled)
-        self.smart_propagation_rewind_frames = int(settings.smart_propagation_rewind_frames)
-        self.smart_propagation_recovery_chunk_size = int(settings.smart_propagation_recovery_chunk_size)
-        self._sync_experimental_controls()
-
     def _build_session_payload(self) -> SessionPayload:
         """Snapshot the current annotator state into the typed persistence model."""
         return SessionPayload(
@@ -1851,7 +1546,6 @@ class AnnotatorMainWindow(QMainWindow):
             },
             view_settings=self._current_view_settings(),
             propagation_settings=self._current_propagation_settings(),
-            experimental_settings=self._current_experimental_settings(),
             prompt_mode_index=int(self.prompt_mode_combo.currentIndex()),
         )
 
@@ -2233,11 +1927,6 @@ class AnnotatorMainWindow(QMainWindow):
         self.add_obj_btn.setEnabled(enabled)
         self.remove_obj_btn.setEnabled(enabled)
         self.object_list.setEnabled(enabled)
-        self.text_prompt_input.setEnabled(enabled)
-        self.generate_text_prompt_btn.setEnabled(enabled)
-        self.accept_text_prompt_btn.setEnabled(enabled)
-        self.clear_text_prompt_btn.setEnabled(enabled)
-        self.text_prompt_list.setEnabled(enabled)
         for row in self._object_row_widgets.values():
             propagate_check = row.get("propagate_check")
             rename_btn = row.get("rename_btn")
@@ -2262,14 +1951,6 @@ class AnnotatorMainWindow(QMainWindow):
         self.autosave_check.setEnabled(enabled)
         self.autosave_minutes_spin.setEnabled(enabled)
         self.propagation_mode_combo.setEnabled(enabled)
-        self.recondition_every_nth_frame_spin.setEnabled(enabled)
-        self.recondition_high_conf_thresh_spin.setEnabled(enabled)
-        self.recondition_high_iou_thresh_spin.setEnabled(enabled)
-        self.use_one_session_chunked_propagation_check.setEnabled(enabled)
-        smart_controls_enabled = enabled and not self.use_one_session_chunked_propagation
-        self.smart_propagation_check.setEnabled(smart_controls_enabled)
-        self.smart_propagation_rewind_spin.setEnabled(smart_controls_enabled)
-        self.smart_propagation_chunk_size_spin.setEnabled(smart_controls_enabled)
         running = propagation.busy
         pending = self._pending_propagation is not None
         self.stop_propagate_btn.setEnabled(running or pending)
@@ -2335,7 +2016,6 @@ class AnnotatorMainWindow(QMainWindow):
         self.box_locked_by_frame_obj.clear()
         self.outputs_by_frame.clear()
         self.manual_propagation_overrides_by_frame_obj.clear()
-        self._clear_text_prompt_proposals_if_needed()
         self._output_version_by_frame.clear()
         self._prefetch_state.provenance_by_frame.clear()
         self._undo_state = None
@@ -2425,142 +2105,6 @@ class AnnotatorMainWindow(QMainWindow):
         self.object_list.setCurrentItem(item)
         self._refresh_object_list_visuals()
         return obj
-
-    def generate_objects_from_text_prompt(self) -> None:
-        """Ask SAM to generate object proposals for the current frame from a text prompt."""
-        if not self.frame_paths:
-            QMessageBox.information(self, "No frames loaded", "Load a frame directory first.")
-            return
-        text_prompt = self.text_prompt_input.text().strip()
-        if not text_prompt:
-            QMessageBox.information(self, "No text prompt", "Enter a text prompt first.")
-            return
-        if self._prefetch_busy:
-            self._cancel_prefetch(restart=False)
-        if not self._ensure_sam_initialized():
-            return
-        task_id = self._enqueue_sam_task(
-            "text_prompt",
-            {
-                "frame_idx": self.current_frame_idx,
-                "frame_path": self.frame_paths[self.current_frame_idx],
-                "text_prompt": text_prompt,
-            },
-        )
-        self._sam_task_contexts[task_id] = SamTaskContext(kind=TASK_KIND_TEXT_PROMPT)
-        self._set_status("Generating text prompt proposals...", progress=0, total=1)
-        self._wait_for_sam_task(task_id)
-
-    def accept_selected_text_prompt_proposals(self) -> None:
-        """Promote checked text-prompt proposals into real objects, boxes, and masks."""
-        if self._text_prompt_proposals_frame_idx != self.current_frame_idx or not self._text_prompt_proposals:
-            QMessageBox.information(self, "No proposals", "Generate text prompt proposals on this frame first.")
-            return
-        selected_indices = self._selected_text_prompt_proposal_indices()
-        if not selected_indices:
-            QMessageBox.information(self, "No proposals selected", "Check at least one proposal to accept.")
-            return
-        frame_size = self._get_current_frame_size()
-        if frame_size is None:
-            QMessageBox.warning(self, "Missing frame size", "Could not determine the current frame size.")
-            return
-        existing_output = self.outputs_by_frame.get(
-            self.current_frame_idx,
-            SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
-        )
-        accepted_obj_ids: List[int] = []
-        prompt_label = self._text_prompt_last_prompt or self.text_prompt_input.text().strip() or "Object"
-        for proposal_idx in selected_indices:
-            if proposal_idx < 0 or proposal_idx >= len(self._text_prompt_proposals):
-                continue
-            proposal = self._text_prompt_proposals[proposal_idx]
-            obj_name = next_prompt_object_name(prompt_label, (obj.name for obj in self.objects))
-            obj = self._create_object_entry(obj_name)
-            accepted_obj_ids.append(obj.obj_id)
-            self._commit_text_prompt_proposal(obj.obj_id, proposal, frame_size, existing_output)
-            existing_output = self.outputs_by_frame.get(self.current_frame_idx, existing_output)
-        if not accepted_obj_ids:
-            QMessageBox.information(self, "No proposals accepted", "No valid proposals were accepted.")
-            return
-        self._note_prompt_change_and_prefetch()
-        self._set_status(f"Accepted {len(accepted_obj_ids)} text prompt object(s).", progress=1, total=1)
-        self.clear_text_prompt_proposals()
-        self._render_current_frame()
-
-    def clear_text_prompt_proposals(self) -> None:
-        """Clear the current text-prompt proposal state and its overlay/list UI."""
-        self._text_prompt_proposals_frame_idx = None
-        self._text_prompt_last_prompt = ""
-        self._text_prompt_proposals = []
-        if hasattr(self, "text_prompt_list"):
-            self.text_prompt_list.clear()
-        self._render_current_frame()
-
-    def _clear_text_prompt_proposals_if_needed(self, frame_idx: Optional[int] = None) -> None:
-        """Discard proposals when leaving the frame that produced them or when forced."""
-        if not self._text_prompt_proposals:
-            return
-        if frame_idx is None or self._text_prompt_proposals_frame_idx != frame_idx:
-            self._text_prompt_proposals_frame_idx = None
-            self._text_prompt_last_prompt = ""
-            self._text_prompt_proposals = []
-            if hasattr(self, "text_prompt_list"):
-                self.text_prompt_list.clear()
-
-    def _selected_text_prompt_proposal_indices(self) -> List[int]:
-        """Return the proposal indices whose checklist entries are currently checked."""
-        selected: List[int] = []
-        for idx in range(self.text_prompt_list.count()):
-            item = self.text_prompt_list.item(idx)
-            if item is None:
-                continue
-            if item.checkState() == Qt.Checked:
-                selected.append(idx)
-        return selected
-
-    def _refresh_text_prompt_list(self) -> None:
-        """Rebuild the proposal checklist from the current in-memory proposal list."""
-        if not hasattr(self, "text_prompt_list"):
-            return
-        self.text_prompt_list.clear()
-        for proposal in self._text_prompt_proposals:
-            x1, y1, x2, y2 = proposal.box_xyxy_px
-            item = QListWidgetItem(
-                f"{proposal.proposal_idx + 1}. score={proposal.score:.3f} box=({x1}, {y1}) -> ({x2}, {y2})"
-            )
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            self.text_prompt_list.addItem(item)
-
-    def _commit_text_prompt_proposal(
-        self,
-        obj_id: int,
-        proposal: TextPromptProposal,
-        frame_size: Tuple[int, int],
-        existing_output: SamFrameOutput,
-    ) -> None:
-        """Insert one accepted text-prompt proposal into prompts, boxes, and outputs."""
-        width, height = frame_size
-        x1, y1, x2, y2 = proposal.box_xyxy_px
-        frame_boxes = self.box_prompts_by_frame_obj.setdefault(self.current_frame_idx, {})
-        frame_boxes[obj_id] = BoxPrompt(x1_px=x1, y1_px=y1, x2_px=x2, y2_px=y2)
-        self._set_current_box_locked(self.current_frame_idx, obj_id, False)
-        self.prompts_by_frame_obj.setdefault(self.current_frame_idx, {}).setdefault(obj_id, [])
-        box_xywh_norm = (
-            float(x1) / width,
-            float(y1) / height,
-            float(max(0, x2 - x1)) / width,
-            float(max(0, y2 - y1)) / height,
-        )
-        proposal_output = SamFrameOutput(
-            obj_ids=[obj_id],
-            masks=[np.asarray(proposal.mask).astype(bool)],
-            boxes_xywh_norm=[box_xywh_norm],
-            scores=[float(proposal.score)],
-            tracker_scores=[0.0],
-        )
-        self.outputs_by_frame[self.current_frame_idx] = self._merge_frame_outputs(existing_output, proposal_output)
-        self._output_version_by_frame[self.current_frame_idx] = self._prefetch_prompt_version
 
     def remove_active_object(self) -> None:
         """Remove the active object and all of its annotations across every frame."""
@@ -2721,7 +2265,6 @@ class AnnotatorMainWindow(QMainWindow):
         if not self.frame_paths:
             return
         self.current_frame_idx = max(0, min(len(self.frame_paths) - 1, frame_idx))
-        self._clear_text_prompt_proposals_if_needed(self.current_frame_idx)
         self._sync_frame_navigation_controls()
         self._render_current_frame()
 
@@ -3055,18 +2598,11 @@ class AnnotatorMainWindow(QMainWindow):
             return True
         if self._sam_worker is not None and not self._sam_ready:
             return False
-        worker = SamWorker(
-            self._checkpoint_path,
-            self._bpe_path,
-            self.recondition_every_nth_frame,
-            self.recondition_high_conf_thresh,
-            self.recondition_high_iou_thresh,
-        )
+        worker = SamWorker(self._checkpoint_path, self._bpe_path)
         thread = QThread()
         worker.moveToThread(thread)
         worker.initialized.connect(self._on_sam_worker_initialized)
         worker.segment_done.connect(self._on_sam_segment_done)
-        worker.text_prompt_done.connect(self._on_sam_text_prompt_done)
         worker.propagate_frame.connect(self._on_sam_propagate_frame)
         worker.propagate_done.connect(self._on_sam_propagate_done)
         worker.propagate_stopped.connect(self._on_sam_propagate_stopped)
@@ -3195,8 +2731,6 @@ class AnnotatorMainWindow(QMainWindow):
                 active_chunk_n_frames=self.chunk_size_spin.value(),
             )
             self._propagation_stop_requested = False
-            self._propagation_smart_restart_requested = False
-            self._smart_propagation_triggered_loss_keys.clear()
             target_note = ""
             if target_frame_idx is not None:
                 target_note = f" (target frame {target_frame_idx + 1})"
@@ -3207,7 +2741,6 @@ class AnnotatorMainWindow(QMainWindow):
             )
             self._propagation_enabled_obj_ids = enabled_obj_ids
             self._propagation_view_frame_idx = self.current_frame_idx
-            self._one_session_chunk_prompt_version = self._prefetch_prompt_version if self.use_one_session_chunked_propagation else None
         state = self._pending_propagation
         if state is None:
             return
@@ -3440,24 +2973,11 @@ class AnnotatorMainWindow(QMainWindow):
         self._propagation_active_chunk_idx = chunk_idx
         self._propagation_active_seed_frame_idx = seed_frame_idx
         self._set_propagation_ui_enabled(False)
-        if state.pending_smart_restart_seed_frame_idx is not None:
-            loss_frame_idx = state.pending_smart_restart_loss_frame_idx
-            restart_note = f"Smart restart: rewound to frame {seed_frame_idx + 1}"
-            if loss_frame_idx is not None:
-                restart_note += f" after loss on frame {loss_frame_idx + 1}"
-            self._set_status(restart_note, progress=state.completed_chunks, total=max(1, state.total_chunks))
-            state.pending_smart_restart_seed_frame_idx = None
-            state.pending_smart_restart_loss_frame_idx = None
-        else:
-            self._set_status(
-                f"Chunk {chunk_idx}/{state.total_chunks} running...",
-                progress=state.completed_chunks,
-                total=state.total_chunks,
-            )
-        use_one_session = self.use_one_session_chunked_propagation
-        rebuild_one_session = bool(use_one_session and state.completed_chunks == 0)
-        if use_one_session and self._one_session_chunk_prompt_version != self._prefetch_prompt_version:
-            rebuild_one_session = True
+        self._set_status(
+            f"Chunk {chunk_idx}/{state.total_chunks} running...",
+            progress=state.completed_chunks,
+            total=state.total_chunks,
+        )
 
         task_id = self._enqueue_sam_task(
             "propagate",
@@ -3466,15 +2986,12 @@ class AnnotatorMainWindow(QMainWindow):
                 "n_frames": chunk_n_frames,
                 "frame_paths": self.frame_paths,
                 "prompt_payload": prompt_payload,
-                "use_one_session": use_one_session,
-                "rebuild_one_session": rebuild_one_session,
             },
         )
         self._sam_task_contexts[task_id] = SamTaskContext(
             kind=TASK_KIND_MANUAL_PROPAGATION,
             seed_frame_idx=seed_frame_idx,
             last_emitted_frame_idx=seed_frame_idx - 1,
-            use_one_session=use_one_session,
             n_frames=chunk_n_frames,
         )
         self._propagation_task_id = task_id
@@ -3526,39 +3043,6 @@ class AnnotatorMainWindow(QMainWindow):
             loop.quit()
         self._sam_task_contexts.pop(task_id, None)
         self._schedule_prefetch_for_next_frame()
-
-    def _on_sam_text_prompt_done(
-        self,
-        task_id: str,
-        frame_idx: int,
-        composite: SamFrameOutput,
-        text_prompt: str,
-    ) -> None:
-        """Store text-prompt proposals, refresh proposal UI, and wake any waiter."""
-        frame_size = self._get_frame_size(frame_idx)
-        proposals: List[TextPromptProposal] = []
-        if frame_size is not None:
-            proposals = build_text_prompt_proposals(
-                masks=composite.masks,
-                boxes_xywh_norm=composite.boxes_xywh_norm,
-                scores=composite.scores,
-                frame_size=frame_size,
-            )
-        self._text_prompt_proposals_frame_idx = frame_idx
-        self._text_prompt_last_prompt = text_prompt
-        self._text_prompt_proposals = proposals
-        self._refresh_text_prompt_list()
-        self._render_current_frame()
-        self._sam_task_results[task_id] = proposals
-        loop = self._sam_waiting.get(task_id)
-        if loop is not None:
-            loop.quit()
-        self._sam_task_contexts.pop(task_id, None)
-        if proposals:
-            self._set_status(f"Generated {len(proposals)} text prompt proposal(s).", progress=1, total=1)
-        else:
-            QMessageBox.information(self, "No proposals", f"No objects found for '{text_prompt}' on this frame.")
-            self._set_status("No text prompt proposals generated.", progress=1, total=1)
 
     def _on_sam_propagate_frame(self, task_id: str, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
         """Handle emitted frames for prefetch, auto-step, or manual propagation tasks."""
@@ -3619,121 +3103,11 @@ class AnnotatorMainWindow(QMainWindow):
         state = self._pending_propagation
         if kind == "manual" and state is not None:
             context["last_emitted_frame_idx"] = abs_frame_idx
-            self._maybe_request_smart_propagation_restart(
-                abs_frame_idx=abs_frame_idx,
-                output=output,
-                enabled_obj_ids=self._propagation_enabled_obj_ids or set(),
-                state=state,
-                task_id=task_id,
-            )
-            if self._propagation_smart_restart_requested:
-                return
             self._set_status(
                 f"Chunk {state.completed_chunks + 1}/{state.total_chunks}: {session_idx + 1}/{total_frames} frames",
                 progress=state.completed_chunks,
                 total=state.total_chunks,
             )
-
-    def _maybe_request_smart_propagation_restart(
-        self,
-        *,
-        abs_frame_idx: int,
-        output: SamFrameOutput,
-        enabled_obj_ids: set[int],
-        state: PendingPropagationState,
-        task_id: str,
-    ) -> None:
-        """Detect object loss and convert it into a rewind-and-recover request."""
-        if self._propagation_smart_restart_requested or not enabled_obj_ids:
-            return
-        if not self._is_smart_propagation_available_for_run():
-            return
-        cooldown_until_frame_idx = state.smart_restart_cooldown_until_frame_idx
-        if cooldown_until_frame_idx is not None and abs_frame_idx <= cooldown_until_frame_idx:
-            return
-
-        has_mask_by_obj_id = {int(obj_id): False for obj_id in enabled_obj_ids}
-        for idx, obj_id in enumerate(output.obj_ids):
-            obj_id_int = int(obj_id)
-            if obj_id_int not in has_mask_by_obj_id or idx >= len(output.masks):
-                continue
-            has_mask = bool(np.asarray(output.masks[idx]).any())
-            has_mask_by_obj_id[obj_id_int] = has_mask
-            if has_mask:
-                self._propagation_seen_obj_ids.add(obj_id_int)
-                self._smart_propagation_waiting_for_recovery_obj_ids.discard(obj_id_int)
-
-        candidate_obj_ids = {
-            int(obj_id)
-            for obj_id in enabled_obj_ids
-            if int(obj_id) not in self._smart_propagation_waiting_for_recovery_obj_ids
-        }
-        if not candidate_obj_ids:
-            return
-
-        decision = detect_smart_propagation_restart(
-            enabled_obj_ids=candidate_obj_ids,
-            has_mask_by_obj_id=has_mask_by_obj_id,
-            previously_seen_obj_ids=self._propagation_seen_obj_ids,
-            already_triggered_loss_keys=self._smart_propagation_triggered_loss_keys,
-            loss_frame_idx=abs_frame_idx,
-            run_start_frame_idx=state.run_start_frame_idx,
-            rewind_frames=self.smart_propagation_rewind_frames,
-        )
-        if not decision.should_restart:
-            return
-
-        restart_seed_frame_idx = decision.restart_seed_frame_idx
-        loss_frame_idx = decision.loss_frame_idx
-        if restart_seed_frame_idx is None or loss_frame_idx is None:
-            return
-        if restart_seed_frame_idx >= abs_frame_idx:
-            return
-
-        self._propagation_smart_restart_requested = True
-        state.pending_smart_restart_seed_frame_idx = restart_seed_frame_idx
-        state.pending_smart_restart_loss_frame_idx = loss_frame_idx
-        state.smart_restart_cooldown_until_frame_idx = loss_frame_idx
-        state.next_seed_frame_idx = restart_seed_frame_idx
-        state.active_chunk_n_frames = self.smart_propagation_recovery_chunk_size
-        for obj_id in decision.lost_obj_ids:
-            self._smart_propagation_triggered_loss_keys.add((int(obj_id), loss_frame_idx))
-            self._propagation_lost_obj_ids.add(int(obj_id))
-            self._smart_propagation_waiting_for_recovery_obj_ids.add(int(obj_id))
-        context = self._sam_task_contexts.get(task_id)
-        if context is not None:
-            context["last_emitted_frame_idx"] = abs_frame_idx
-        self._set_status(
-            f"Smart propagation triggered at frame {abs_frame_idx + 1}; rewinding to frame {restart_seed_frame_idx + 1}.",
-            progress=state.completed_chunks,
-            total=max(1, state.total_chunks),
-        )
-        if self._sam_worker is not None:
-            self._sam_worker.cancel_propagation()
-
-    def _handle_smart_propagation_restart_after_stop(self, context: Dict[str, object]) -> None:
-        """Clear replayed outputs and relaunch the recovery chunk after cancellation."""
-        state = self._pending_propagation
-        if state is None:
-            self._clear_pending_propagation_state()
-            return
-
-        restart_seed_frame_idx = state.pending_smart_restart_seed_frame_idx
-        if restart_seed_frame_idx is None:
-            self._clear_pending_propagation_state()
-            return
-
-        last_emitted_frame_idx = int(context.get("last_emitted_frame_idx", restart_seed_frame_idx))
-        enabled_obj_ids = self._propagation_enabled_obj_ids or set()
-        self._clear_replayed_propagation_range(
-            start_seed_frame_idx=restart_seed_frame_idx,
-            end_frame_idx=last_emitted_frame_idx,
-            obj_ids=enabled_obj_ids,
-        )
-        self._propagation_busy = False
-        self._set_propagation_ui_enabled(True)
-        self._propagation_smart_restart_requested = False
-        self._start_propagation_chunk_async(enabled_obj_ids=enabled_obj_ids, state=state)
 
     def _on_sam_propagate_done(self, task_id: str, last_masked_frame_idx: int, chunk_last_frame_idx: int) -> None:
         """Advance, complete, or resume propagation after a worker run ends normally."""
@@ -3827,10 +3201,7 @@ class AnnotatorMainWindow(QMainWindow):
         if kind in {"manual", "auto"}:
             self._propagation_busy = False
             self._set_propagation_ui_enabled(True)
-            if kind == "manual" and self._pending_propagation is not None and self._propagation_smart_restart_requested:
-                self._handle_smart_propagation_restart_after_stop(context)
-            else:
-                self._clear_pending_propagation_state()
+            self._clear_pending_propagation_state()
 
         self._sam_task_results[task_id] = None
         loop = self._sam_waiting.get(task_id)
@@ -3864,10 +3235,6 @@ class AnnotatorMainWindow(QMainWindow):
         title = "SAM3 task failed"
         if kind in {"manual", "auto"}:
             title = "Propagation failed"
-        elif kind == "text_prompt":
-            title = "Text prompt generation failed"
-        elif kind == "update_experimental_settings":
-            title = "Experimental settings update failed"
         if is_warning:
             QMessageBox.warning(self, title, message)
         else:
@@ -4048,33 +3415,6 @@ class AnnotatorMainWindow(QMainWindow):
             return
         self.outputs_by_frame[frame_idx] = updated_output
 
-    def _clear_replayed_propagation_range(
-        self,
-        *,
-        start_seed_frame_idx: int,
-        end_frame_idx: int,
-        obj_ids: set[int],
-    ) -> None:
-        """Delete outputs and boxes that will be replayed after a smart rewind."""
-        if not obj_ids or end_frame_idx <= start_seed_frame_idx:
-            return
-        start_frame_idx = max(0, start_seed_frame_idx + 1)
-        final_frame_idx = min(end_frame_idx, len(self.frame_paths) - 1)
-        for frame_idx in range(start_frame_idx, final_frame_idx + 1):
-            frame_boxes = self.box_prompts_by_frame_obj.get(frame_idx)
-            if frame_boxes is not None:
-                for obj_id in obj_ids:
-                    frame_boxes.pop(obj_id, None)
-                    self._set_current_box_locked(frame_idx, obj_id, False)
-                if not frame_boxes:
-                    self.box_prompts_by_frame_obj.pop(frame_idx, None)
-            for obj_id in obj_ids:
-                self._remove_object_output_from_frame(frame_idx, obj_id)
-        if self.current_frame_idx >= start_frame_idx and self.current_frame_idx <= final_frame_idx:
-            self._sync_current_box_lock_check()
-            self.refresh_point_list()
-            self._render_current_frame()
-
     def _remove_object_annotations_from_frame(self, frame_idx: int, obj_id: Optional[int]) -> None:
         """Remove prompts, box, locks, and output for one object on one frame."""
         if obj_id is None:
@@ -4196,14 +3536,7 @@ class AnnotatorMainWindow(QMainWindow):
         self._propagation_active_chunk_idx = None
         self._propagation_active_seed_frame_idx = None
         self._propagation_task_id = None
-        self._one_session_chunk_prompt_version = None
         self._propagation_stop_requested = False
-        self._propagation_seen_obj_ids.clear()
-        self._propagation_lost_obj_ids.clear()
-        self._smart_propagation_waiting_for_recovery_obj_ids.clear()
-        self._propagation_loss_notified = False
-        self._propagation_smart_restart_requested = False
-        self._smart_propagation_triggered_loss_keys.clear()
         if hasattr(self, "stop_propagate_btn"):
             self.stop_propagate_btn.setEnabled(False)
         self._schedule_prefetch_for_next_frame()
@@ -4373,7 +3706,6 @@ class AnnotatorMainWindow(QMainWindow):
         self._selected_box_obj_id = None
         self.flagged_frame_indices.clear()
         self._box_rubber_band.hide()
-        self._clear_text_prompt_proposals_if_needed()
         self._reset_prefetch_state()
 
         existing_names = {p.name for p in frame_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS}
@@ -4388,10 +3720,8 @@ class AnnotatorMainWindow(QMainWindow):
 
         self._checkpoint_path = payload.checkpoint_path
         self._set_optional_combo_path(self.checkpoint_combo, self._checkpoint_path)
-        self._apply_experimental_settings(payload.experimental_settings)
         update_progress(36, "Initializing SAM worker...")
         self._initialize_sam_worker(show_errors=False)
-        self._apply_experimental_settings_live()
 
         update_progress(44, "Restoring objects...")
         self.objects.clear()
@@ -4557,7 +3887,6 @@ class AnnotatorMainWindow(QMainWindow):
         if self.current_frame_idx in self.outputs_by_frame:
             img = self._draw_output_overlay(img, self.outputs_by_frame[self.current_frame_idx])
 
-        img = self._draw_text_prompt_proposals_overlay(img)
         img = self._draw_points_overlay(img)
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -4620,35 +3949,6 @@ class AnnotatorMainWindow(QMainWindow):
                 blended = cv2.addWeighted(overlay, 1.0 - mask_alpha, color_img, mask_alpha, 0)
                 overlay = np.where(mask[..., None].astype(bool), blended, overlay)
 
-        return overlay
-
-    def _draw_text_prompt_proposals_overlay(self, img: np.ndarray) -> np.ndarray:
-        """Draw temporary masks and boxes for current text-prompt proposals."""
-        if self._text_prompt_proposals_frame_idx != self.current_frame_idx or not self._text_prompt_proposals:
-            return img
-        overlay = img.copy()
-        mask_alpha = 0.25
-        proposal_color = (0, 200, 255)
-        for idx, proposal in enumerate(self._text_prompt_proposals):
-            mask = np.asarray(proposal.mask).astype(np.uint8)
-            if mask.shape[:2] != img.shape[:2]:
-                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-            color_img = np.zeros_like(img)
-            color_img[:] = proposal_color
-            blended = cv2.addWeighted(overlay, 1.0 - mask_alpha, color_img, mask_alpha, 0)
-            overlay = np.where(mask[..., None].astype(bool), blended, overlay)
-            x1, y1, x2, y2 = proposal.box_xyxy_px
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), proposal_color, 1)
-            cv2.putText(
-                overlay,
-                f"T{idx + 1}:{proposal.score:.2f}",
-                (x1, max(20, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                proposal_color,
-                1,
-                cv2.LINE_AA,
-            )
         return overlay
 
     def _draw_points_overlay(self, img: np.ndarray) -> np.ndarray:

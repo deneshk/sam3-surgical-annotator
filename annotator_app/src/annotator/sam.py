@@ -1,27 +1,21 @@
 """SAM3 runtime bridge used by the annotator UI.
 
 This module isolates the vendored SAM3 predictor import and wraps it in a
-Qt-friendly worker that executes segment, text-prompt, propagation, and
-prefetch tasks off the main thread.
+Qt-friendly worker that executes segment, propagation, and prefetch tasks off
+the main thread.
 """
 
 from __future__ import annotations
 
 import threading
 from collections import deque
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 from PIL import Image as PilImage
 from PySide6.QtCore import QObject, QMetaObject, Qt, Signal, Slot
 
-from annotator.models import (
-    DEFAULT_RECONDITION_EVERY_NTH_FRAME,
-    DEFAULT_RECONDITION_HIGH_CONF_THRESH,
-    DEFAULT_RECONDITION_HIGH_IOU_THRESH,
-    SamFrameOutput,
-)
+from annotator.models import SamFrameOutput
 from annotator.propagation.frame_outputs import merge_frame_outputs
 from annotator.vendor.sam3_runtime import ensure_vendor_sam3_on_path
 
@@ -37,17 +31,11 @@ class Sam3Adapter:
         self,
         checkpoint_path: Optional[str] = None,
         bpe_path: Optional[str] = None,
-        recondition_every_nth_frame: int = DEFAULT_RECONDITION_EVERY_NTH_FRAME,
-        recondition_high_conf_thresh: float = DEFAULT_RECONDITION_HIGH_CONF_THRESH,
-        recondition_high_iou_thresh: float = DEFAULT_RECONDITION_HIGH_IOU_THRESH,
     ) -> None:
-        """Construct the vendored predictor with the annotator's tracker tuning defaults."""
+        """Construct the vendored predictor with default tracker settings."""
         self.predictor = Sam3VideoPredictor(
             checkpoint_path=checkpoint_path,
             bpe_path=bpe_path,
-            recondition_every_nth_frame=recondition_every_nth_frame,
-            recondition_high_conf_thresh=recondition_high_conf_thresh,
-            recondition_high_iou_thresh=recondition_high_iou_thresh,
         )
         self.session_id: Optional[str] = None
 
@@ -111,32 +99,6 @@ class Sam3Adapter:
         response = self.predictor.handle_request(request=request)
         return self._parse_output(response["outputs"])
 
-    def add_text_prompt(self, frame_idx: int, text: str) -> SamFrameOutput:
-        """Run SAM3 text grounding for a single frame session."""
-        if not self.session_id:
-            raise RuntimeError("No active SAM3 session")
-        response = self.predictor.handle_request(
-            request={
-                "type": "add_prompt",
-                "session_id": self.session_id,
-                "frame_index": frame_idx,
-                "text": text,
-            }
-        )
-        return self._parse_output(response["outputs"])
-
-    def update_experimental_settings(
-        self,
-        recondition_every_nth_frame: int,
-        recondition_high_conf_thresh: float,
-        recondition_high_iou_thresh: float,
-    ) -> None:
-        """Apply tracker tuning knobs directly to the loaded SAM3 model."""
-        model = self.predictor.model
-        model.recondition_every_nth_frame = int(recondition_every_nth_frame)
-        model.recondition_high_conf_thresh = float(recondition_high_conf_thresh)
-        model.recondition_high_iou_thresh = float(recondition_high_iou_thresh)
-
     def propagate_n_frames(self, start_frame_idx: int, max_frames: int) -> Dict[int, SamFrameOutput]:
         """Collect propagation outputs eagerly into a frame-indexed mapping."""
         if not self.session_id:
@@ -192,7 +154,6 @@ class SamWorker(QObject):
 
     initialized = Signal(bool, str)
     segment_done = Signal(str, int, object)
-    text_prompt_done = Signal(str, int, object, str)
     propagate_frame = Signal(str, int, object, int, int)
     propagate_done = Signal(str, int, int)
     propagate_stopped = Signal(str, int)
@@ -203,23 +164,16 @@ class SamWorker(QObject):
         self,
         checkpoint_path: Optional[str],
         bpe_path: Optional[str],
-        recondition_every_nth_frame: int,
-        recondition_high_conf_thresh: float,
-        recondition_high_iou_thresh: float,
     ) -> None:
         """Capture worker configuration and initialize queue/cancellation state."""
         super().__init__()
         self.checkpoint_path = checkpoint_path
         self.bpe_path = bpe_path
-        self.recondition_every_nth_frame = recondition_every_nth_frame
-        self.recondition_high_conf_thresh = recondition_high_conf_thresh
-        self.recondition_high_iou_thresh = recondition_high_iou_thresh
         self.sam_adapter: Optional[Sam3Adapter] = None
         self._queue = deque()
         self._busy = False
         self._cancel_prefetch = False
         self._cancel_propagation_event = threading.Event()
-        self._one_session_frame_signature: Optional[Tuple[str, ...]] = None
 
     @Slot()
     def initialize(self) -> None:
@@ -228,9 +182,6 @@ class SamWorker(QObject):
             self.sam_adapter = Sam3Adapter(
                 checkpoint_path=self.checkpoint_path,
                 bpe_path=self.bpe_path,
-                recondition_every_nth_frame=self.recondition_every_nth_frame,
-                recondition_high_conf_thresh=self.recondition_high_conf_thresh,
-                recondition_high_iou_thresh=self.recondition_high_iou_thresh,
             )
         except Exception as exc:
             self.sam_adapter = None
@@ -270,14 +221,9 @@ class SamWorker(QObject):
                 self.task_failed.emit(task_id, "SAM3 not initialized.", False)
             elif task_type == "close_session":
                 self.sam_adapter.close_session()
-                self._one_session_frame_signature = None
                 self.task_finished.emit(task_id)
             elif task_type == "segment":
                 self._run_segment(task_id, payload)
-            elif task_type == "text_prompt":
-                self._run_text_prompt(task_id, payload)
-            elif task_type == "update_experimental_settings":
-                self._run_update_experimental_settings(task_id, payload)
             elif task_type in {"propagate", "prefetch"}:
                 self._run_propagate(task_id, payload, task_type == "prefetch")
             else:
@@ -310,7 +256,6 @@ class SamWorker(QObject):
             return
         img_pil = PilImage.open(str(img_path))
         self.sam_adapter.start_session([img_pil])
-        self._one_session_frame_signature = None
         composite = SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[])
         for obj_id, prompt in obj_payload.items():
             points_rel = prompt.get("points_rel", [])
@@ -340,46 +285,6 @@ class SamWorker(QObject):
             composite = merge_frame_outputs(composite, obj_output)
         self.segment_done.emit(task_id, frame_idx, composite)
 
-    def _run_text_prompt(self, task_id: str, payload: object) -> None:
-        """Run text-prompt grounding against the requested frame."""
-        data = payload or {}
-        frame_idx = int(data.get("frame_idx", -1))
-        text_prompt = str(data.get("text_prompt", "")).strip()
-        if frame_idx < 0:
-            self.task_failed.emit(task_id, "Invalid frame index.", False)
-            return
-        if not text_prompt:
-            self.task_failed.emit(task_id, "Enter a text prompt first.", True)
-            return
-        img_path = data.get("frame_path")
-        if not img_path:
-            self.task_failed.emit(task_id, "Missing frame path.", False)
-            return
-        img_pil = PilImage.open(str(img_path))
-        self.sam_adapter.start_session([img_pil])
-        self._one_session_frame_signature = None
-        result = self.sam_adapter.add_text_prompt(frame_idx=0, text=text_prompt)
-        self.text_prompt_done.emit(task_id, frame_idx, result, text_prompt)
-
-    def _run_update_experimental_settings(self, task_id: str, payload: object) -> None:
-        """Hot-apply tracker heuristics without recreating the worker."""
-        data = payload or {}
-        self.recondition_every_nth_frame = int(
-            data.get("recondition_every_nth_frame", self.recondition_every_nth_frame)
-        )
-        self.recondition_high_conf_thresh = float(
-            data.get("recondition_high_conf_thresh", self.recondition_high_conf_thresh)
-        )
-        self.recondition_high_iou_thresh = float(
-            data.get("recondition_high_iou_thresh", self.recondition_high_iou_thresh)
-        )
-        self.sam_adapter.update_experimental_settings(
-            self.recondition_every_nth_frame,
-            self.recondition_high_conf_thresh,
-            self.recondition_high_iou_thresh,
-        )
-        self.task_finished.emit(task_id)
-
     def _run_propagate(self, task_id: str, payload: object, is_prefetch: bool) -> None:
         """Execute tracker propagation for either visible playback or next-frame cache fill."""
         data = payload or {}
@@ -387,8 +292,6 @@ class SamWorker(QObject):
         n_frames = int(data.get("n_frames", 0))
         frame_paths = data.get("frame_paths", [])
         prompt_payload = data.get("prompt_payload", {})
-        use_one_session = bool(data.get("use_one_session", False)) and not is_prefetch
-        rebuild_one_session = bool(data.get("rebuild_one_session", False))
         if seed_frame_idx < 0 or n_frames <= 1:
             self.task_failed.emit(task_id, "No forward frames available from current seed frame.", True)
             return
@@ -401,20 +304,8 @@ class SamWorker(QObject):
         if not is_prefetch:
             self._cancel_propagation_event.clear()
 
-        frame_signature = tuple(str(Path(path)) for path in frame_paths)
-        if use_one_session:
-            if (
-                rebuild_one_session
-                or self.sam_adapter.session_id is None
-                or self._one_session_frame_signature != frame_signature
-            ):
-                imgs_pil = [PilImage.open(str(frame_path)) for frame_path in frame_paths]
-                self.sam_adapter.start_session(imgs_pil)
-                self._one_session_frame_signature = frame_signature
-        else:
-            imgs_pil = [PilImage.open(str(frame_paths[i])) for i in range(abs_start, abs_end)]
-            self.sam_adapter.start_session(imgs_pil)
-            self._one_session_frame_signature = None
+        imgs_pil = [PilImage.open(str(frame_paths[i])) for i in range(abs_start, abs_end)]
+        self.sam_adapter.start_session(imgs_pil)
 
         for obj_id, prompt in prompt_payload.items():
             points_rel = prompt.get("points_rel", [])
@@ -423,7 +314,7 @@ class SamWorker(QObject):
             if not points_rel:
                 continue
             self.sam_adapter.add_object_points(
-                frame_idx=abs_start if use_one_session else 0,
+                frame_idx=0,
                 obj_id=int(obj_id),
                 points_rel=points_rel,
                 labels=labels,
@@ -432,9 +323,9 @@ class SamWorker(QObject):
 
         last_masked_frame_idx: Optional[int] = None
         last_emitted_frame_idx = abs_start - 1
-        max_frames = (actual_n - 1) if use_one_session else actual_n
+        max_frames = actual_n
         for session_idx, output in self.sam_adapter.propagate_n_frames_stream(
-            start_frame_idx=abs_start if use_one_session else 0,
+            start_frame_idx=0,
             max_frames=max_frames,
         ):
             if not is_prefetch and self._cancel_propagation_event.is_set():
@@ -443,7 +334,7 @@ class SamWorker(QObject):
                 return
             if is_prefetch and self._cancel_prefetch:
                 continue
-            abs_frame_idx = int(session_idx) if use_one_session else abs_start + int(session_idx)
+            abs_frame_idx = abs_start + int(session_idx)
             last_emitted_frame_idx = abs_frame_idx
             chunk_session_idx = abs_frame_idx - abs_start
             self.propagate_frame.emit(task_id, abs_frame_idx, output, int(chunk_session_idx), actual_n)

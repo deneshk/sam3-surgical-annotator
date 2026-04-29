@@ -114,18 +114,12 @@ class RuntimeStateTests(unittest.TestCase):
 
         state.begin_run(enabled_obj_ids={1, 3}, view_frame_idx=8)
         state.begin_chunk(chunk_idx=2, seed_frame_idx=8, task_id="propagate:2")
-        state.seen_obj_ids.add(1)
-        state.lost_obj_ids.add(3)
-        state.waiting_for_recovery_obj_ids.add(3)
-        state.smart_restart_requested = True
         state.reset()
 
         self.assertFalse(state.busy)
         self.assertIsNone(state.enabled_obj_ids)
         self.assertIsNone(state.active_chunk_idx)
-        self.assertFalse(state.smart_restart_requested)
-        self.assertEqual(state.seen_obj_ids, set())
-        self.assertEqual(state.lost_obj_ids, set())
+        self.assertFalse(state.stop_requested)
 
 
 @unittest.skipUnless(HAVE_PYSIDE6, "PySide6 is not installed")
