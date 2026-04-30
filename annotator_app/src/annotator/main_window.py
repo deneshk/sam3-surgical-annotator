@@ -69,6 +69,7 @@ from annotator.models import (
 )
 from annotator.persistence.session_models import SessionPayload
 from annotator.persistence.session_repository import SessionRepository
+from annotator.storage.frame_output_store import FrameOutputStore
 from annotator.propagation.runtime import (
     PrefetchState,
     PropagationRuntimeState,
@@ -133,7 +134,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.prompts_by_frame_obj: Dict[int, Dict[int, List[PointPrompt]]] = {}
         self.box_prompts_by_frame_obj: Dict[int, Dict[int, BoxPrompt]] = {}
         self.box_locked_by_frame_obj: Dict[int, Dict[int, bool]] = {}
-        self.outputs_by_frame: Dict[int, SamFrameOutput] = {}
+        self.outputs_by_frame = FrameOutputStore(max_cached_frames=32)
         self.manual_propagation_overrides_by_frame_obj: Dict[int, Dict[int, bool]] = {}
         self._active_prompt_rows: List[Tuple[str, int]] = []
 
@@ -2154,17 +2155,9 @@ class AnnotatorMainWindow(QMainWindow):
             if frame_map
         }
 
-        for frame_idx, out in list(self.outputs_by_frame.items()):
-            keep_idx = [i for i, oid in enumerate(out.obj_ids) if oid != obj_id]
-            if len(keep_idx) == len(out.obj_ids):
-                continue
-            self.outputs_by_frame[frame_idx] = SamFrameOutput(
-                obj_ids=[out.obj_ids[i] for i in keep_idx],
-                masks=[out.masks[i] for i in keep_idx],
-                boxes_xywh_norm=[out.boxes_xywh_norm[i] for i in keep_idx],
-                scores=[out.scores[i] for i in keep_idx],
-                tracker_scores=[out.tracker_scores[i] for i in keep_idx],
-            )
+        for frame_idx in list(self.outputs_by_frame.keys()):
+            if self.outputs_by_frame.remove_object(frame_idx, obj_id):
+                self._output_version_by_frame.pop(frame_idx, None)
 
         for i in range(self.object_list.count()):
             item = self.object_list.item(i)
@@ -3871,7 +3864,7 @@ class AnnotatorMainWindow(QMainWindow):
         }
 
         update_progress(76, "Restoring masks and outputs...")
-        self.outputs_by_frame = {}
+        self.outputs_by_frame.clear()
         self._output_version_by_frame.clear()
         for frame_idx, output in payload.outputs_by_frame.items():
             frame_idx_int = int(frame_idx)
@@ -4653,6 +4646,7 @@ class AnnotatorMainWindow(QMainWindow):
         try:
             self._stop_playback()
             self._autosave_timer.stop()
+            self.outputs_by_frame.close()
             if self._sam_thread is not None:
                 self._sam_thread.quit()
                 self._sam_thread.wait()
