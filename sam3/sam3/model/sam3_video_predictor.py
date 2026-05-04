@@ -9,6 +9,8 @@ import socket
 import sys
 import time
 import uuid
+from copy import deepcopy
+from collections import defaultdict
 from contextlib import closing
 from typing import List, Optional
 
@@ -69,6 +71,12 @@ class Sam3VideoPredictor:
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
+                experimental_transfer_memory_from_session_id=request.get(
+                    "experimental_transfer_memory_from_session_id", None
+                ),
+                experimental_transfer_frame_offset=request.get(
+                    "experimental_transfer_frame_offset", 0
+                ),
             )
         elif request_type == "add_mask":
             return self.add_mask(
@@ -116,7 +124,13 @@ class Sam3VideoPredictor:
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
-    def start_session(self, resource_path, session_id=None):
+    def start_session(
+        self,
+        resource_path,
+        session_id=None,
+        experimental_transfer_memory_from_session_id=None,
+        experimental_transfer_frame_offset=0,
+    ):
         """
         Start a new inference session on an image or a video. Here `resource_path`
         can be either a path to an image file (for image inference) or an MP4 file
@@ -132,6 +146,23 @@ class Sam3VideoPredictor:
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
         )
+        transfer_report = None
+        if experimental_transfer_memory_from_session_id:
+            source_session = self._ALL_INFERENCE_STATES.get(
+                experimental_transfer_memory_from_session_id
+            )
+            if source_session is not None:
+                transfer_report = self._transfer_session_memory(
+                    source_state=source_session["state"],
+                    target_state=inference_state,
+                    frame_offset=int(experimental_transfer_frame_offset or 0),
+                )
+            else:
+                transfer_report = {
+                    "transferred": False,
+                    "reason": "source session not found",
+                }
+
         if not session_id:
             session_id = str(uuid.uuid4())
         self._ALL_INFERENCE_STATES[session_id] = {
@@ -143,7 +174,222 @@ class Sam3VideoPredictor:
             f"started new session {session_id}; {self._get_session_stats()}; "
             f"{self._get_torch_and_gpu_properties()}"
         )
-        return {"session_id": session_id}
+        response = {"session_id": session_id}
+        if transfer_report is not None:
+            response["experimental_memory_transfer"] = transfer_report
+        return response
+
+    def _transfer_session_memory(self, source_state, target_state, frame_offset):
+        """
+        Experimental: copy tracker memory from one session state into a new session.
+
+        Frame indices are remapped as ``target_idx = source_idx + frame_offset``.
+        This is intended for chunk-local propagation experiments where the last
+        frame of the previous chunk becomes frame 0 in the next chunk.
+        """
+        if source_state.get("orig_height") != target_state.get("orig_height"):
+            return {"transferred": False, "reason": "height mismatch"}
+        if source_state.get("orig_width") != target_state.get("orig_width"):
+            return {"transferred": False, "reason": "width mismatch"}
+        if not source_state.get("tracker_inference_states"):
+            return {"transferred": False, "reason": "no tracker states to transfer"}
+        if not source_state.get("tracker_metadata"):
+            return {"transferred": False, "reason": "no tracker metadata to transfer"}
+
+        max_frame_idx = int(target_state["num_frames"]) - 1
+        copied_tracker_states = []
+        kept_frame_count = 0
+        for tracker_state in source_state["tracker_inference_states"]:
+            copied_state = self._copy_tracker_state_for_new_session(
+                tracker_state=tracker_state,
+                target_state=target_state,
+                frame_offset=frame_offset,
+                max_frame_idx=max_frame_idx,
+            )
+            kept_frame_count += self._count_tracker_memory_frames(copied_state)
+            copied_tracker_states.append(copied_state)
+
+        target_state["tracker_inference_states"] = copied_tracker_states
+        target_state["tracker_metadata"] = self._copy_tracker_metadata_for_new_session(
+            metadata=source_state["tracker_metadata"],
+            frame_offset=frame_offset,
+            max_frame_idx=max_frame_idx,
+        )
+        target_state["cached_frame_outputs"] = self._remap_frame_dict(
+            source_state.get("cached_frame_outputs", {}),
+            frame_offset=frame_offset,
+            max_frame_idx=max_frame_idx,
+        )
+        target_state["action_history"] = self._remap_action_history(
+            source_state.get("action_history", []),
+            frame_offset=frame_offset,
+            max_frame_idx=max_frame_idx,
+        )
+        return {
+            "transferred": True,
+            "source_tracker_states": len(source_state["tracker_inference_states"]),
+            "target_tracker_states": len(copied_tracker_states),
+            "kept_tracker_memory_frames": kept_frame_count,
+            "frame_offset": frame_offset,
+        }
+
+    def _copy_tracker_state_for_new_session(
+        self,
+        tracker_state,
+        target_state,
+        frame_offset,
+        max_frame_idx,
+    ):
+        copied_state = deepcopy(tracker_state)
+        copied_state["video_height"] = target_state["orig_height"]
+        copied_state["video_width"] = target_state["orig_width"]
+        copied_state["num_frames"] = target_state["num_frames"]
+        copied_state["cached_features"] = target_state["feature_cache"]
+
+        copied_state["point_inputs_per_obj"] = {
+            obj_idx: self._remap_frame_dict(per_frame, frame_offset, max_frame_idx)
+            for obj_idx, per_frame in copied_state.get("point_inputs_per_obj", {}).items()
+        }
+        copied_state["mask_inputs_per_obj"] = {
+            obj_idx: self._remap_frame_dict(per_frame, frame_offset, max_frame_idx)
+            for obj_idx, per_frame in copied_state.get("mask_inputs_per_obj", {}).items()
+        }
+        for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+            copied_state["output_dict"][storage_key] = self._remap_frame_dict(
+                copied_state["output_dict"].get(storage_key, {}),
+                frame_offset,
+                max_frame_idx,
+            )
+            copied_state["consolidated_frame_inds"][storage_key] = self._remap_frame_set(
+                copied_state["consolidated_frame_inds"].get(storage_key, set()),
+                frame_offset,
+                max_frame_idx,
+            )
+
+        for per_obj_dict_name in ["output_dict_per_obj", "temp_output_dict_per_obj"]:
+            for obj_output_dict in copied_state.get(per_obj_dict_name, {}).values():
+                for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+                    obj_output_dict[storage_key] = self._remap_frame_dict(
+                        obj_output_dict.get(storage_key, {}),
+                        frame_offset,
+                        max_frame_idx,
+                    )
+
+        copied_state["frames_already_tracked"] = self._remap_frame_dict(
+            copied_state.get("frames_already_tracked", {}),
+            frame_offset,
+            max_frame_idx,
+        )
+        first_ann = copied_state.get("first_ann_frame_idx")
+        copied_state["first_ann_frame_idx"] = self._remap_frame_idx(
+            first_ann, frame_offset, max_frame_idx
+        )
+        copied_state["tracking_has_started"] = bool(
+            copied_state["output_dict"]["cond_frame_outputs"]
+            or copied_state["output_dict"]["non_cond_frame_outputs"]
+        )
+        return copied_state
+
+    def _copy_tracker_metadata_for_new_session(
+        self,
+        metadata,
+        frame_offset,
+        max_frame_idx,
+    ):
+        copied_metadata = deepcopy(metadata)
+        frame_scores = defaultdict(dict)
+        for frame_idx, scores in copied_metadata.get(
+            "obj_id_to_tracker_score_frame_wise", {}
+        ).items():
+            remapped = self._remap_frame_idx(frame_idx, frame_offset, max_frame_idx)
+            if remapped is not None:
+                frame_scores[remapped] = scores
+        copied_metadata["obj_id_to_tracker_score_frame_wise"] = frame_scores
+
+        rank0_metadata = copied_metadata.get("rank0_metadata")
+        if rank0_metadata is not None:
+            if "suppressed_obj_ids" in rank0_metadata:
+                rank0_metadata["suppressed_obj_ids"] = defaultdict(
+                    set,
+                    self._remap_frame_dict(
+                        rank0_metadata["suppressed_obj_ids"],
+                        frame_offset,
+                        max_frame_idx,
+                    ),
+                )
+            for key in ["unmatched_frame_inds", "overlap_pair_to_frame_inds"]:
+                if key in rank0_metadata:
+                    remapped_lists = defaultdict(list)
+                    for obj_key, frame_indices in rank0_metadata[key].items():
+                        remapped_lists[obj_key] = [
+                            remapped
+                            for frame_idx in frame_indices
+                            for remapped in [
+                                self._remap_frame_idx(
+                                    frame_idx, frame_offset, max_frame_idx
+                                )
+                            ]
+                            if remapped is not None
+                        ]
+                    rank0_metadata[key] = remapped_lists
+            if "obj_first_frame_idx" in rank0_metadata:
+                rank0_metadata["obj_first_frame_idx"] = {
+                    obj_id: remapped
+                    for obj_id, frame_idx in rank0_metadata[
+                        "obj_first_frame_idx"
+                    ].items()
+                    for remapped in [
+                        self._remap_frame_idx(frame_idx, frame_offset, max_frame_idx)
+                    ]
+                    if remapped is not None
+                }
+        return copied_metadata
+
+    def _count_tracker_memory_frames(self, tracker_state):
+        frame_indices = set()
+        for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+            frame_indices.update(tracker_state["output_dict"].get(storage_key, {}).keys())
+        return len(frame_indices)
+
+    def _remap_action_history(self, actions, frame_offset, max_frame_idx):
+        remapped_actions = []
+        for action in deepcopy(actions):
+            frame_idx = action.get("frame_idx")
+            if frame_idx is None:
+                remapped_actions.append(action)
+                continue
+            remapped = self._remap_frame_idx(frame_idx, frame_offset, max_frame_idx)
+            if remapped is None:
+                continue
+            action["frame_idx"] = remapped
+            remapped_actions.append(action)
+        return remapped_actions
+
+    def _remap_frame_dict(self, frame_dict, frame_offset, max_frame_idx):
+        remapped = {}
+        for frame_idx, value in frame_dict.items():
+            new_frame_idx = self._remap_frame_idx(frame_idx, frame_offset, max_frame_idx)
+            if new_frame_idx is not None:
+                remapped[new_frame_idx] = value
+        return remapped
+
+    def _remap_frame_set(self, frame_set, frame_offset, max_frame_idx):
+        return {
+            new_frame_idx
+            for frame_idx in frame_set
+            for new_frame_idx in [
+                self._remap_frame_idx(frame_idx, frame_offset, max_frame_idx)
+            ]
+            if new_frame_idx is not None
+        }
+
+    def _remap_frame_idx(self, frame_idx, frame_offset, max_frame_idx):
+        if frame_idx is None:
+            return None
+        new_frame_idx = int(frame_idx) + int(frame_offset)
+        if new_frame_idx < 0 or new_frame_idx > max_frame_idx:
+            return None
+        return new_frame_idx
 
     def add_prompt(
         self,

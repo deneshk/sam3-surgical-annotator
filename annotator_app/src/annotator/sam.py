@@ -38,29 +38,63 @@ class Sam3Adapter:
             bpe_path=bpe_path,
         )
         self.session_id: Optional[str] = None
+        self.session_abs_start_frame_idx: Optional[int] = None
+        self.last_memory_transfer_report: Optional[dict] = None
 
-    def start_session(self, resource_path) -> None:
-        """Start a fresh SAM3 session for a frame directory or PIL image list."""
-        if self.session_id:
+    def start_session(
+        self,
+        resource_path,
+        *,
+        abs_start_frame_idx: Optional[int] = None,
+        transfer_memory_from_previous: bool = False,
+    ) -> None:
+        """Start a SAM3 session, optionally copying tracker memory from the previous one."""
+        previous_session_id = self.session_id
+        previous_abs_start_frame_idx = self.session_abs_start_frame_idx
+        self.last_memory_transfer_report = None
+        if previous_session_id and not transfer_memory_from_previous:
             self.close_session()
+            previous_session_id = None
+            previous_abs_start_frame_idx = None
+
+        request = {
+            "type": "start_session",
+            "resource_path": resource_path,
+        }
+        if (
+            transfer_memory_from_previous
+            and previous_session_id
+            and previous_abs_start_frame_idx is not None
+            and abs_start_frame_idx is not None
+        ):
+            request["experimental_transfer_memory_from_session_id"] = previous_session_id
+            request["experimental_transfer_frame_offset"] = (
+                int(previous_abs_start_frame_idx) - int(abs_start_frame_idx)
+            )
         response = self.predictor.handle_request(
-            request={
-                "type": "start_session",
-                "resource_path": resource_path,
-            }
+            request=request
         )
         self.session_id = response["session_id"]
+        self.session_abs_start_frame_idx = abs_start_frame_idx
+        self.last_memory_transfer_report = response.get("experimental_memory_transfer")
+        if previous_session_id and previous_session_id != self.session_id:
+            self._close_session_id(previous_session_id)
 
     def close_session(self) -> None:
         """Close the current SAM3 session if one is active."""
         if self.session_id:
-            self.predictor.handle_request(
-                request={
-                    "type": "close_session",
-                    "session_id": self.session_id,
-                }
-            )
+            self._close_session_id(self.session_id)
             self.session_id = None
+            self.session_abs_start_frame_idx = None
+
+    def _close_session_id(self, session_id: str) -> None:
+        """Close a specific SAM3 session id without changing adapter bookkeeping."""
+        self.predictor.handle_request(
+            request={
+                "type": "close_session",
+                "session_id": session_id,
+            }
+        )
 
     def reset_session(self) -> None:
         """Reset SAM3 state without tearing down the session handle."""
@@ -305,7 +339,11 @@ class SamWorker(QObject):
             self._cancel_propagation_event.clear()
 
         imgs_pil = [PilImage.open(str(frame_paths[i])) for i in range(abs_start, abs_end)]
-        self.sam_adapter.start_session(imgs_pil)
+        self.sam_adapter.start_session(
+            imgs_pil,
+            abs_start_frame_idx=abs_start,
+            transfer_memory_from_previous=not is_prefetch,
+        )
 
         for obj_id, prompt in prompt_payload.items():
             points_rel = prompt.get("points_rel", [])
