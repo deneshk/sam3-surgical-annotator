@@ -107,6 +107,31 @@ class Sam3Adapter:
             }
         )
 
+    def memory_summary(self) -> dict:
+        """Return a compact debug summary of the active SAM3 session memory."""
+        if not self.session_id:
+            return {
+                "session_id": None,
+                "num_frames": 0,
+                "tracker_states": 0,
+                "object_ids": [],
+                "cond_frames": [],
+                "non_cond_frames": [],
+                "tracked_frames": [],
+                "cached_output_frames": [],
+                "actions": 0,
+                "transfer": self.last_memory_transfer_report,
+            }
+        response = self.predictor.handle_request(
+            request={
+                "type": "memory_summary",
+                "session_id": self.session_id,
+            }
+        )
+        response["abs_start_frame_idx"] = self.session_abs_start_frame_idx
+        response["transfer"] = self.last_memory_transfer_report
+        return response
+
     def add_object_points(
         self,
         frame_idx: int,
@@ -187,6 +212,7 @@ class SamWorker(QObject):
     """Background worker that serializes all SAM3 operations through one queue."""
 
     initialized = Signal(bool, str)
+    memory_summary_done = Signal(str, object)
     segment_done = Signal(str, int, object)
     propagate_frame = Signal(str, int, object, int, int)
     propagate_done = Signal(str, int, int)
@@ -256,6 +282,8 @@ class SamWorker(QObject):
             elif task_type == "close_session":
                 self.sam_adapter.close_session()
                 self.task_finished.emit(task_id)
+            elif task_type == "memory_summary":
+                self.memory_summary_done.emit(task_id, self.sam_adapter.memory_summary())
             elif task_type == "segment":
                 self._run_segment(task_id, payload)
             elif task_type in {"propagate", "prefetch"}:

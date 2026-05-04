@@ -9,8 +9,8 @@ import socket
 import sys
 import time
 import uuid
-from copy import deepcopy
 from collections import defaultdict
+from copy import deepcopy
 from contextlib import closing
 from typing import List, Optional
 
@@ -107,6 +107,8 @@ class Sam3VideoPredictor:
             return self.reset_session(session_id=request["session_id"])
         elif request_type == "close_session":
             return self.close_session(session_id=request["session_id"])
+        elif request_type == "memory_summary":
+            return self.memory_summary(session_id=request["session_id"])
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
@@ -425,6 +427,43 @@ class Sam3VideoPredictor:
             obj_id=obj_id,
         )
         return {"frame_index": frame_idx, "outputs": outputs}
+
+    def memory_summary(self, session_id: str):
+        """Return a compact debug summary of tracker memory for an active session."""
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+        tracker_states = inference_state.get("tracker_inference_states", [])
+        tracker_metadata = inference_state.get("tracker_metadata", {})
+        cached_frame_outputs = inference_state.get("cached_frame_outputs", {})
+        action_history = inference_state.get("action_history", [])
+
+        cond_frames = set()
+        non_cond_frames = set()
+        tracked_frames = set()
+        object_ids = set()
+        for tracker_state in tracker_states:
+            object_ids.update(int(obj_id) for obj_id in tracker_state.get("obj_ids", []))
+            output_dict = tracker_state.get("output_dict", {})
+            cond_frames.update(output_dict.get("cond_frame_outputs", {}).keys())
+            non_cond_frames.update(output_dict.get("non_cond_frame_outputs", {}).keys())
+            tracked_frames.update(tracker_state.get("frames_already_tracked", {}).keys())
+
+        metadata_obj_ids = tracker_metadata.get("obj_ids_all_gpu", [])
+        object_ids.update(int(obj_id) for obj_id in metadata_obj_ids)
+
+        return {
+            "session_id": session_id,
+            "num_frames": int(inference_state.get("num_frames", 0)),
+            "tracker_states": len(tracker_states),
+            "object_ids": sorted(object_ids),
+            "cond_frames": sorted(int(frame_idx) for frame_idx in cond_frames),
+            "non_cond_frames": sorted(int(frame_idx) for frame_idx in non_cond_frames),
+            "tracked_frames": sorted(int(frame_idx) for frame_idx in tracked_frames),
+            "cached_output_frames": sorted(
+                int(frame_idx) for frame_idx in cached_frame_outputs.keys()
+            ),
+            "actions": len(action_history),
+        }
 
     def add_mask(
         self,

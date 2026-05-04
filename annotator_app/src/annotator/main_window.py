@@ -866,6 +866,15 @@ class AnnotatorMainWindow(QMainWindow):
 
         self.mode_label = QLabel("Mode: Prompt")
         processing_layout.addWidget(self.mode_label)
+        memory_debug_row = QHBoxLayout()
+        self.memory_summary_btn = QPushButton("Refresh Memory")
+        self.memory_summary_btn.setToolTip("Refresh the active SAM3 session memory-bank debug summary.")
+        self.memory_summary_btn.clicked.connect(self.refresh_memory_bank_summary)
+        self.memory_summary_label = QLabel("Memory: no active SAM session")
+        self.memory_summary_label.setWordWrap(True)
+        memory_debug_row.addWidget(self.memory_summary_btn)
+        memory_debug_row.addWidget(self.memory_summary_label, 1)
+        processing_layout.addLayout(memory_debug_row)
         processing_layout.addStretch(1)
         return processing_tab
 
@@ -1778,6 +1787,15 @@ class AnnotatorMainWindow(QMainWindow):
         self.task_requested.emit(task_id, task_type, payload, priority)
         return task_id
 
+    def refresh_memory_bank_summary(self) -> None:
+        """Queue a compact read-only memory-bank summary from the SAM worker."""
+        if self._sam_worker is None or not self._sam_ready:
+            self.memory_summary_label.setText("Memory: SAM not initialized")
+            return
+        self.memory_summary_label.setText("Memory: refreshing...")
+        task_id = self._enqueue_sam_task("memory_summary", {}, priority=True)
+        self._sam_task_contexts[task_id] = SamTaskContext(kind="memory_summary")
+
     def _wait_for_sam_task(self, task_id: str) -> object:
         """Block the current UI flow until an asynchronous SAM task records a result."""
         loop = QEventLoop()
@@ -1982,6 +2000,7 @@ class AnnotatorMainWindow(QMainWindow):
         self.chunks_spin.setEnabled(enabled and not self.use_target_frame_check.isChecked())
         self.translate_prompts_check.setEnabled(enabled and self._is_tracker_propagation_mode())
         self.use_point_prompts_for_propagation_check.setEnabled(enabled and self._is_tracker_propagation_mode())
+        self.memory_summary_btn.setEnabled(enabled)
         self._sync_current_box_lock_check()
 
     def _sync_current_box_lock_check(self) -> None:
@@ -2669,6 +2688,7 @@ class AnnotatorMainWindow(QMainWindow):
         thread = QThread()
         worker.moveToThread(thread)
         worker.initialized.connect(self._on_sam_worker_initialized)
+        worker.memory_summary_done.connect(self._on_sam_memory_summary_done)
         worker.segment_done.connect(self._on_sam_segment_done)
         worker.propagate_frame.connect(self._on_sam_propagate_frame)
         worker.propagate_done.connect(self._on_sam_propagate_done)
@@ -3111,6 +3131,50 @@ class AnnotatorMainWindow(QMainWindow):
         self._sam_task_contexts.pop(task_id, None)
         self._schedule_prefetch_for_next_frame()
 
+    def _on_sam_memory_summary_done(self, task_id: str, summary: object) -> None:
+        """Display a compact debug summary of the active SAM memory bank."""
+        self.memory_summary_label.setText(self._format_memory_bank_summary(summary))
+        self._sam_task_contexts.pop(task_id, None)
+
+    def _format_memory_bank_summary(self, summary: object) -> str:
+        """Convert worker memory-bank summary data into one compact label."""
+        if not isinstance(summary, dict):
+            return "Memory: unavailable"
+        session_id = summary.get("session_id")
+        if not session_id:
+            return "Memory: no active SAM session"
+
+        def frame_range(values: object) -> str:
+            frames = [int(frame_idx) for frame_idx in values or []]
+            if not frames:
+                return "-"
+            if len(frames) <= 4:
+                return ",".join(str(frame_idx) for frame_idx in frames)
+            return f"{frames[0]}-{frames[-1]} ({len(frames)})"
+
+        obj_ids = summary.get("object_ids") or []
+        obj_text = ",".join(str(obj_id) for obj_id in obj_ids) if obj_ids else "-"
+        transfer = summary.get("transfer")
+        if isinstance(transfer, dict):
+            transfer_text = "xfer ok" if transfer.get("transferred") else f"xfer {transfer.get('reason', 'no')}"
+            if transfer.get("transferred"):
+                transfer_text = (
+                    f"{transfer_text} off {transfer.get('frame_offset')} "
+                    f"mem {transfer.get('kept_tracker_memory_frames')}"
+                )
+        else:
+            transfer_text = "xfer -"
+
+        return (
+            f"Memory: {str(session_id)[:8]} | frames {summary.get('num_frames', 0)} "
+            f"| states {summary.get('tracker_states', 0)} | objs {obj_text} "
+            f"| cond {frame_range(summary.get('cond_frames'))} "
+            f"| mem {frame_range(summary.get('non_cond_frames'))} "
+            f"| tracked {frame_range(summary.get('tracked_frames'))} "
+            f"| cached {frame_range(summary.get('cached_output_frames'))} "
+            f"| actions {summary.get('actions', 0)} | {transfer_text}"
+        )
+
     def _on_sam_propagate_frame(self, task_id: str, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
         """Handle emitted frames for prefetch, auto-step, or manual propagation tasks."""
         context = self._sam_task_contexts.get(task_id, {})
@@ -3297,6 +3361,10 @@ class AnnotatorMainWindow(QMainWindow):
             self._prefetch_cached_frame_idx = None
             self._prefetch_cached_seed_idx = None
             self._prefetch_cached_version = None
+            self._sam_task_contexts.pop(task_id, None)
+            return
+        if kind == "memory_summary":
+            self.memory_summary_label.setText(f"Memory: unavailable ({message})")
             self._sam_task_contexts.pop(task_id, None)
             return
         title = "SAM3 task failed"
