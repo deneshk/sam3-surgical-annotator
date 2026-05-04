@@ -10,6 +10,51 @@ import numpy as np
 from annotator.models import BoxPrompt, SamFrameOutput
 
 
+def output_object_has_mask(output: SamFrameOutput, obj_id: int) -> bool:
+    """Return whether one object has a present, non-empty mask in a frame output."""
+    if obj_id not in output.obj_ids:
+        return False
+    idx = output.obj_ids.index(obj_id)
+    if idx >= len(output.masks):
+        return False
+    return bool(np.asarray(output.masks[idx]).any())
+
+
+def find_disappeared_object_ids(
+    output: SamFrameOutput,
+    enabled_obj_ids: set[int],
+) -> list[int]:
+    """Return enabled object ids missing from a frame output or represented by empty masks."""
+    return [
+        int(obj_id)
+        for obj_id in sorted(enabled_obj_ids)
+        if not output_object_has_mask(output, int(obj_id))
+    ]
+
+
+def recovery_seed_frame_idx(
+    *,
+    disappear_frame_idx: int,
+    run_start_frame_idx: int,
+    lookback_frames: int = 3,
+) -> int:
+    """Choose the restart seed frame for a disappearance recovery attempt."""
+    return max(int(run_start_frame_idx), int(disappear_frame_idx) - int(lookback_frames))
+
+
+def target_limited_chunk_size(
+    *,
+    seed_frame_idx: int,
+    target_frame_idx: Optional[int],
+    requested_chunk_size: int,
+) -> int:
+    """Cap a chunk size so tracker propagation does not run past the target frame."""
+    chunk_size = int(requested_chunk_size)
+    if target_frame_idx is None:
+        return chunk_size
+    return min(chunk_size, int(target_frame_idx) - int(seed_frame_idx) + 1)
+
+
 def merge_frame_outputs(base_output: SamFrameOutput, new_output: SamFrameOutput) -> SamFrameOutput:
     """Replace overlapping object outputs and append new objects into one frame result."""
     merged = SamFrameOutput(

@@ -57,6 +57,7 @@ from annotator.models import (
     DEFAULT_PROPAGATION_CHUNK_SIZE,
     DEFAULT_PROPAGATION_CHUNKS,
     DEFAULT_SEGMENTATION_OPACITY,
+    DEFAULT_TARGET_RECOVERY_CHUNK_SIZE,
     ObjectInfo,
     PendingPropagationState,
     PointPrompt,
@@ -79,9 +80,12 @@ from annotator.propagation.runtime import (
     TASK_KIND_PREFETCH_WAIT,
 )
 from annotator.propagation.frame_outputs import (
+    find_disappeared_object_ids,
     merge_frame_outputs,
     remove_object_from_output,
+    recovery_seed_frame_idx,
     sample_boxes_from_output_masks,
+    target_limited_chunk_size,
 )
 from annotator.propagation.prompt_payloads import (
     build_propagation_seed_payload,
@@ -181,6 +185,8 @@ class AnnotatorMainWindow(QMainWindow):
         self.translate_prompts_on_propagation: bool = True
         self.use_point_prompts_for_propagation: bool = True
         self.use_target_frame: bool = False
+        self.target_recovery_restart_enabled: bool = True
+        self.target_recovery_chunk_size: int = DEFAULT_TARGET_RECOVERY_CHUNK_SIZE
         self.segmentation_opacity: float = DEFAULT_SEGMENTATION_OPACITY
         self.box_line_thickness: int = DEFAULT_BOX_LINE_THICKNESS
         self._research_mode_enabled: bool = bool(research_mode_enabled)
@@ -864,6 +870,24 @@ class AnnotatorMainWindow(QMainWindow):
         target_row.addWidget(self.computed_chunks_label)
         processing_layout.addLayout(target_row)
 
+        recovery_row = QHBoxLayout()
+        self.target_recovery_restart_check = QCheckBox("Recovery Restart")
+        self.target_recovery_restart_check.setChecked(self.target_recovery_restart_enabled)
+        self.target_recovery_restart_check.setToolTip(
+            "When target-frame tracker propagation loses an object, restart from three frames earlier."
+        )
+        self.target_recovery_restart_check.toggled.connect(self._on_target_recovery_restart_toggled)
+        self.target_recovery_chunk_spin = QSpinBox()
+        self.target_recovery_chunk_spin.setMinimum(2)
+        self.target_recovery_chunk_spin.setMaximum(9999)
+        self.target_recovery_chunk_spin.setValue(self.target_recovery_chunk_size)
+        self.target_recovery_chunk_spin.setToolTip("Frames in a disappearance recovery chunk, including the restart seed.")
+        self.target_recovery_chunk_spin.valueChanged.connect(self._on_target_recovery_chunk_size_changed)
+        recovery_row.addWidget(self.target_recovery_restart_check)
+        recovery_row.addWidget(QLabel("Recovery Chunk:"))
+        recovery_row.addWidget(self.target_recovery_chunk_spin)
+        processing_layout.addLayout(recovery_row)
+
         self.mode_label = QLabel("Mode: Prompt")
         processing_layout.addWidget(self.mode_label)
         memory_debug_row = QHBoxLayout()
@@ -921,6 +945,7 @@ class AnnotatorMainWindow(QMainWindow):
             self.chunk_size_spin,
             self.chunks_spin,
             self.target_frame_spin,
+            self.target_recovery_chunk_spin,
             self.propagation_mode_combo,
         ):
             self._install_focus_return_on_widget(widget)
@@ -987,6 +1012,11 @@ class AnnotatorMainWindow(QMainWindow):
         self.use_target_frame = checked
         self.target_frame_spin.setEnabled(checked)
         self.chunks_spin.setEnabled(not checked)
+        if hasattr(self, "target_recovery_restart_check"):
+            self.target_recovery_restart_check.setEnabled(checked and self._is_tracker_propagation_mode())
+            self.target_recovery_chunk_spin.setEnabled(
+                checked and self._is_tracker_propagation_mode() and self.target_recovery_restart_enabled
+            )
         if checked and self.frame_paths:
             current_value = self.current_frame_idx + 1
             if self.target_frame_spin.value() <= current_value:
@@ -996,6 +1026,17 @@ class AnnotatorMainWindow(QMainWindow):
     def _on_propagation_target_changed(self, _value: int) -> None:
         """Refresh the derived chunk count label after target-frame edits."""
         self._update_target_chunk_label()
+
+    def _on_target_recovery_restart_toggled(self, checked: bool) -> None:
+        """Store whether target-frame propagation should restart after object loss."""
+        self.target_recovery_restart_enabled = bool(checked)
+        self.target_recovery_chunk_spin.setEnabled(
+            bool(checked) and self.use_target_frame_check.isChecked() and self._is_tracker_propagation_mode()
+        )
+
+    def _on_target_recovery_chunk_size_changed(self, value: int) -> None:
+        """Store the large recovery chunk size used after object loss."""
+        self.target_recovery_chunk_size = int(value)
 
     def _compute_target_chunk_count(
         self,
@@ -1826,6 +1867,10 @@ class AnnotatorMainWindow(QMainWindow):
             self.translate_prompts_check.setEnabled(self._is_tracker_propagation_mode())
         if hasattr(self, "use_point_prompts_for_propagation_check"):
             self.use_point_prompts_for_propagation_check.setEnabled(self._is_tracker_propagation_mode())
+        if hasattr(self, "target_recovery_restart_check"):
+            recovery_enabled = bool(self.use_target_frame_check.isChecked()) and self._is_tracker_propagation_mode()
+            self.target_recovery_restart_check.setEnabled(recovery_enabled)
+            self.target_recovery_chunk_spin.setEnabled(recovery_enabled and self.target_recovery_restart_enabled)
 
     def _note_prompt_change_and_prefetch(self) -> None:
         """Invalidate stale next-frame cache after prompt edits and maybe start a new prefetch."""
@@ -2000,6 +2045,9 @@ class AnnotatorMainWindow(QMainWindow):
         self.chunks_spin.setEnabled(enabled and not self.use_target_frame_check.isChecked())
         self.translate_prompts_check.setEnabled(enabled and self._is_tracker_propagation_mode())
         self.use_point_prompts_for_propagation_check.setEnabled(enabled and self._is_tracker_propagation_mode())
+        recovery_enabled = enabled and self.use_target_frame_check.isChecked() and self._is_tracker_propagation_mode()
+        self.target_recovery_restart_check.setEnabled(recovery_enabled)
+        self.target_recovery_chunk_spin.setEnabled(recovery_enabled and self.target_recovery_restart_enabled)
         self.memory_summary_btn.setEnabled(enabled)
         self._sync_current_box_lock_check()
 
@@ -2816,6 +2864,8 @@ class AnnotatorMainWindow(QMainWindow):
                 target_frame_idx=target_frame_idx,
                 run_start_frame_idx=self.current_frame_idx,
                 active_chunk_n_frames=self.chunk_size_spin.value(),
+                recovery_restart_enabled=bool(self.target_recovery_restart_check.isChecked()),
+                recovery_chunk_size=int(self.target_recovery_chunk_spin.value()),
             )
             self._propagation_stop_requested = False
             target_note = ""
@@ -3044,7 +3094,7 @@ class AnnotatorMainWindow(QMainWindow):
             return
         chunk_idx = state.completed_chunks + 1
         seed_frame_idx = state.next_seed_frame_idx
-        use_carryover_sampling = chunk_idx > 1
+        use_carryover_sampling = chunk_idx > 1 or state.recovery_restart_active
         prompt_payload = self._build_seed_prompts(
             seed_frame_idx=seed_frame_idx,
             use_carryover_sampling=use_carryover_sampling,
@@ -3054,12 +3104,12 @@ class AnnotatorMainWindow(QMainWindow):
             self._clear_pending_propagation_state()
             return
 
-        chunk_n_frames = int(state.active_chunk_n_frames or state.n_frames)
+        chunk_n_frames = target_limited_chunk_size(
+            seed_frame_idx=seed_frame_idx,
+            target_frame_idx=state.target_frame_idx,
+            requested_chunk_size=int(state.active_chunk_n_frames or state.n_frames),
+        )
         if state.target_frame_idx is not None:
-            chunk_n_frames = min(
-                chunk_n_frames,
-                int(state.target_frame_idx) - int(seed_frame_idx) + 1,
-            )
             if chunk_n_frames <= 1:
                 self._clear_pending_propagation_state()
                 QMessageBox.information(self, "Target reached", "No more frames left to propagate.")
@@ -3184,6 +3234,83 @@ class AnnotatorMainWindow(QMainWindow):
             f"| actions {summary.get('actions', 0)} | {transfer_text}"
         )
 
+    def _note_target_recovery_disappearance(
+        self,
+        abs_frame_idx: int,
+        output: SamFrameOutput,
+        state: PendingPropagationState,
+    ) -> None:
+        """Record the first recoverable object disappearance in a target-frame run."""
+        if state.target_frame_idx is None or not state.recovery_restart_enabled:
+            return
+        if state.pending_recovery_disappearance is not None:
+            return
+        enabled_obj_ids = self._propagation_enabled_obj_ids or set()
+        if not enabled_obj_ids:
+            return
+        disappeared_obj_ids = find_disappeared_object_ids(output, enabled_obj_ids)
+        for obj_id in disappeared_obj_ids:
+            key = (int(obj_id), int(abs_frame_idx))
+            if key in state.recovery_attempted_disappearances:
+                continue
+            state.recovery_attempted_disappearances.add(key)
+            state.pending_recovery_disappearance = key
+            self._set_status(
+                f"Object {obj_id} disappeared at frame {abs_frame_idx + 1}; recovery restart queued.",
+                progress=state.completed_chunks,
+                total=state.total_chunks,
+            )
+            return
+
+    def _clear_enabled_outputs_after_frame(
+        self,
+        frame_idx: int,
+        enabled_obj_ids: set[int],
+        end_frame_idx: Optional[int] = None,
+    ) -> None:
+        """Remove speculative enabled-object outputs after a recovery restart point."""
+        if not enabled_obj_ids:
+            return
+        final_frame_idx = len(self.frame_paths) - 1 if end_frame_idx is None else int(end_frame_idx)
+        for clear_frame_idx in range(frame_idx + 1, min(final_frame_idx, len(self.frame_paths) - 1) + 1):
+            for obj_id in enabled_obj_ids:
+                self._remove_object_output_from_frame(clear_frame_idx, int(obj_id))
+
+    def _prepare_recovery_restart(
+        self,
+        state: PendingPropagationState,
+        disappearance: Tuple[int, int],
+    ) -> int:
+        """Move the pending run back to a recovery seed and return that seed frame."""
+        obj_id, disappear_frame_idx = disappearance
+        restart_seed_idx = recovery_seed_frame_idx(
+            disappear_frame_idx=disappear_frame_idx,
+            run_start_frame_idx=state.run_start_frame_idx,
+        )
+        self._clear_enabled_outputs_after_frame(
+            restart_seed_idx,
+            self._propagation_enabled_obj_ids or set(),
+            end_frame_idx=state.target_frame_idx,
+        )
+        state.next_seed_frame_idx = restart_seed_idx
+        state.active_chunk_n_frames = max(2, int(state.recovery_chunk_size))
+        state.recovery_restart_active = True
+        if state.target_frame_idx is not None:
+            recomputed = self._compute_target_chunk_count(
+                state.next_seed_frame_idx,
+                state.target_frame_idx,
+                state.active_chunk_n_frames,
+            )
+            state.remaining_chunks = 0 if recomputed is None else recomputed
+            state.total_chunks = state.completed_chunks + state.remaining_chunks
+        state.pending_recovery_disappearance = None
+        self._set_status(
+            f"Recovery restart for object {obj_id}: frame {restart_seed_idx + 1}, chunk {state.active_chunk_n_frames}.",
+            progress=state.completed_chunks,
+            total=max(1, state.total_chunks),
+        )
+        return restart_seed_idx
+
     def _on_sam_propagate_frame(self, task_id: str, abs_frame_idx: int, output: SamFrameOutput, session_idx: int, total_frames: int) -> None:
         """Handle emitted frames for prefetch, auto-step, or manual propagation tasks."""
         context = self._sam_task_contexts.get(task_id, {})
@@ -3226,6 +3353,10 @@ class AnnotatorMainWindow(QMainWindow):
                 )
             return
 
+        state = self._pending_propagation
+        if kind == "manual" and state is not None:
+            self._note_target_recovery_disappearance(abs_frame_idx, output, state)
+
         existing_output = self.outputs_by_frame.get(
             abs_frame_idx,
             SamFrameOutput(obj_ids=[], masks=[], boxes_xywh_norm=[], scores=[], tracker_scores=[]),
@@ -3240,7 +3371,6 @@ class AnnotatorMainWindow(QMainWindow):
             self._set_current_frame_idx(abs_frame_idx)
         elif abs_frame_idx == self.current_frame_idx:
             self._render_current_frame()
-        state = self._pending_propagation
         if kind == "manual" and state is not None:
             context["last_emitted_frame_idx"] = abs_frame_idx
             self._set_status(
@@ -3272,10 +3402,24 @@ class AnnotatorMainWindow(QMainWindow):
         state = self._pending_propagation
         if state is None:
             return
+        if state.pending_recovery_disappearance is not None:
+            self._prepare_recovery_restart(state, state.pending_recovery_disappearance)
+            self._propagation_busy = False
+            self._set_propagation_ui_enabled(True)
+            self._sam_task_contexts.pop(task_id, None)
+            if state.remaining_chunks <= 0:
+                self._clear_pending_propagation_state()
+                return
+            self._start_propagation_chunk_async(
+                enabled_obj_ids=self._propagation_enabled_obj_ids or set(),
+                state=state,
+            )
+            return
         state.remaining_chunks -= 1
         state.completed_chunks += 1
         state.next_seed_frame_idx = chunk_last_frame_idx
         state.active_chunk_n_frames = state.n_frames
+        state.recovery_restart_active = False
         if state.target_frame_idx is not None:
             recomputed = self._compute_target_chunk_count(
                 state.next_seed_frame_idx,

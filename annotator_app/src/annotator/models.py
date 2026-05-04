@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +15,7 @@ VALID_PROPAGATION_MODES = {
 }
 DEFAULT_PROPAGATION_CHUNK_SIZE = 2
 DEFAULT_PROPAGATION_CHUNKS = 1
+DEFAULT_TARGET_RECOVERY_CHUNK_SIZE = 100
 DEFAULT_SEGMENTATION_OPACITY = 0.6
 DEFAULT_BOX_LINE_THICKNESS = 2
 
@@ -108,3 +109,8 @@ class PendingPropagationState:
     completed_chunks: int = 0
     run_start_frame_idx: int = 0
     active_chunk_n_frames: Optional[int] = None
+    recovery_restart_enabled: bool = True
+    recovery_chunk_size: int = DEFAULT_TARGET_RECOVERY_CHUNK_SIZE
+    recovery_attempted_disappearances: set[Tuple[int, int]] = field(default_factory=set)
+    pending_recovery_disappearance: Optional[Tuple[int, int]] = None
+    recovery_restart_active: bool = False

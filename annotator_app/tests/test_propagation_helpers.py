@@ -13,9 +13,12 @@ if str(SRC_ROOT) not in sys.path:
 
 from annotator.models import BoxPrompt, PointPrompt, SamFrameOutput
 from annotator.propagation.frame_outputs import (
+    find_disappeared_object_ids,
     merge_frame_outputs,
     remove_object_from_output,
+    recovery_seed_frame_idx,
     sample_boxes_from_output_masks,
+    target_limited_chunk_size,
 )
 from annotator.propagation.prompt_payloads import (
     build_propagation_seed_payload,
@@ -137,6 +140,56 @@ class PropagationHelperTests(unittest.TestCase):
 
         self.assertEqual(cloned, source)
         self.assertIsNot(cloned[0], source[0])
+
+    def test_find_disappeared_object_ids_flags_missing_and_empty_masks(self) -> None:
+        output = SamFrameOutput(
+            obj_ids=[1, 2],
+            masks=[
+                np.array([[True, False]], dtype=bool),
+                np.array([[False, False]], dtype=bool),
+            ],
+            boxes_xywh_norm=[(0.0, 0.0, 0.5, 0.5), (0.0, 0.0, 0.5, 0.5)],
+            scores=[1.0, 1.0],
+            tracker_scores=[1.0, 1.0],
+        )
+
+        disappeared = find_disappeared_object_ids(output, {1, 2, 3})
+
+        self.assertEqual(disappeared, [2, 3])
+
+    def test_recovery_seed_frame_idx_clamps_to_run_start(self) -> None:
+        self.assertEqual(
+            recovery_seed_frame_idx(
+                disappear_frame_idx=6,
+                run_start_frame_idx=2,
+            ),
+            3,
+        )
+        self.assertEqual(
+            recovery_seed_frame_idx(
+                disappear_frame_idx=4,
+                run_start_frame_idx=3,
+            ),
+            3,
+        )
+
+    def test_target_limited_chunk_size_caps_at_target(self) -> None:
+        self.assertEqual(
+            target_limited_chunk_size(
+                seed_frame_idx=10,
+                target_frame_idx=14,
+                requested_chunk_size=100,
+            ),
+            5,
+        )
+        self.assertEqual(
+            target_limited_chunk_size(
+                seed_frame_idx=10,
+                target_frame_idx=None,
+                requested_chunk_size=100,
+            ),
+            100,
+        )
 
 
 if __name__ == "__main__":
