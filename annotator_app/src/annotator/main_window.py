@@ -2848,7 +2848,6 @@ class AnnotatorMainWindow(QMainWindow):
         enabled_obj_ids: set[int],
     ) -> Optional[Dict[int, Dict[str, object]]]:
         """Build normalized tracker seed payloads from prompts, boxes, and prior masks."""
-        del use_carryover_sampling
         frame_boxes = self.box_prompts_by_frame_obj.get(seed_frame_idx, {})
         frame_prompts = self.prompts_by_frame_obj.get(seed_frame_idx, {})
 
@@ -2871,7 +2870,7 @@ class AnnotatorMainWindow(QMainWindow):
             ),
         )
 
-        if payload_result.missing_obj_ids:
+        if payload_result.missing_obj_ids and not use_carryover_sampling:
             missing_names = [
                 self._find_object(obj_id).name if self._find_object(obj_id) else str(obj_id)
                 for obj_id in payload_result.missing_obj_ids
@@ -2892,7 +2891,7 @@ class AnnotatorMainWindow(QMainWindow):
             )
             return None
 
-        if not payload_result.payload_by_obj_id:
+        if not payload_result.payload_by_obj_id and not use_carryover_sampling:
             QMessageBox.information(
                 self,
                 "No prompts",
@@ -3082,6 +3081,7 @@ class AnnotatorMainWindow(QMainWindow):
                 "n_frames": chunk_n_frames,
                 "frame_paths": self.frame_paths,
                 "prompt_payload": prompt_payload,
+                "allow_empty_result": True,
             },
         )
         self._sam_task_contexts[task_id] = SamTaskContext(
@@ -3287,8 +3287,12 @@ class AnnotatorMainWindow(QMainWindow):
             else:
                 state.remaining_chunks = recomputed
             state.total_chunks = state.completed_chunks + state.remaining_chunks
+        no_masks_in_chunk = last_masked_frame_idx < 0
+        chunk_status = f"Chunk {state.completed_chunks}/{state.total_chunks} complete."
+        if no_masks_in_chunk:
+            chunk_status = f"{chunk_status} No valid masks in this chunk."
         self._set_status(
-            f"Chunk {state.completed_chunks}/{state.total_chunks} complete.",
+            chunk_status,
             progress=state.completed_chunks,
             total=state.total_chunks,
         )
@@ -3303,8 +3307,11 @@ class AnnotatorMainWindow(QMainWindow):
             return
 
         if state.remaining_chunks == 0:
+            completion_status = f"Propagation complete: {state.total_chunks}/{state.total_chunks} chunks."
+            if no_masks_in_chunk:
+                completion_status = f"{completion_status} Last chunk had no valid masks."
             self._set_status(
-                f"Propagation complete: {state.total_chunks}/{state.total_chunks} chunks.",
+                completion_status,
                 progress=state.total_chunks,
                 total=state.total_chunks,
             )

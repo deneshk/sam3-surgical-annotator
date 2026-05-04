@@ -354,6 +354,7 @@ class SamWorker(QObject):
         n_frames = int(data.get("n_frames", 0))
         frame_paths = data.get("frame_paths", [])
         prompt_payload = data.get("prompt_payload", {})
+        allow_empty_result = bool(data.get("allow_empty_result", False))
         if seed_frame_idx < 0 or n_frames <= 1:
             self.task_failed.emit(task_id, "No forward frames available from current seed frame.", True)
             return
@@ -377,7 +378,7 @@ class SamWorker(QObject):
             points_rel = prompt.get("points_rel", [])
             labels = prompt.get("labels", [])
             mask_input = prompt.get("mask_input")
-            if not points_rel:
+            if not points_rel and mask_input is None:
                 continue
             self.sam_adapter.add_object_points(
                 frame_idx=0,
@@ -414,11 +415,15 @@ class SamWorker(QObject):
         else:
             self._cancel_propagation_event.clear()
 
-        if last_masked_frame_idx is None:
+        if last_masked_frame_idx is None and not allow_empty_result:
             self.task_failed.emit(
                 task_id,
                 "Chunk produced no valid masks. Please refine prompts and run again.",
                 True,
             )
             return
-        self.propagate_done.emit(task_id, last_masked_frame_idx, abs_end - 1)
+        self.propagate_done.emit(
+            task_id,
+            last_masked_frame_idx if last_masked_frame_idx is not None else -1,
+            abs_end - 1,
+        )
