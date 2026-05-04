@@ -3056,6 +3056,15 @@ class AnnotatorMainWindow(QMainWindow):
             return
 
         chunk_n_frames = int(state.active_chunk_n_frames or state.n_frames)
+        if state.target_frame_idx is not None:
+            chunk_n_frames = min(
+                chunk_n_frames,
+                int(state.target_frame_idx) - int(seed_frame_idx) + 1,
+            )
+            if chunk_n_frames <= 1:
+                self._clear_pending_propagation_state()
+                QMessageBox.information(self, "Target reached", "No more frames left to propagate.")
+                return
         self._propagation_busy = True
         self._propagation_active_chunk_idx = chunk_idx
         self._propagation_active_seed_frame_idx = seed_frame_idx
@@ -3263,10 +3272,9 @@ class AnnotatorMainWindow(QMainWindow):
         state = self._pending_propagation
         if state is None:
             return
-        chunk_seed_frame_idx = context.get("seed_frame_idx", state.next_seed_frame_idx)
         state.remaining_chunks -= 1
         state.completed_chunks += 1
-        state.next_seed_frame_idx = last_masked_frame_idx
+        state.next_seed_frame_idx = chunk_last_frame_idx
         state.active_chunk_n_frames = state.n_frames
         if state.target_frame_idx is not None:
             recomputed = self._compute_target_chunk_count(
